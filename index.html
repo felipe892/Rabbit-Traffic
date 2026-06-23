@@ -1,0 +1,1106 @@
+<!DOCTYPE html>
+<html lang="pt-BR"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Relatório Mensal — Rabbit Assessoria</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Inter', 'Segoe UI', sans-serif; background: #0d0d14; color: #e8e8f0; }
+
+/* ─── HERO ─── */
+.hero { background: #0d0d14; border-bottom: 1px solid #1e1e2e; padding: 28px 40px 26px; position: relative; overflow: hidden; }
+.hero::before { content:''; position:absolute; top:-80px; right:-80px; width:300px; height:300px; background:radial-gradient(circle,rgba(229,62,62,.09) 0%,transparent 70%); pointer-events:none; }
+.logo-row { display:flex; justify-content:space-between; align-items:center; }
+.logo-img { height:38px; width:auto; }
+.period-pill { background:#1a1a2e; border:1px solid #2a2a3e; border-radius:20px; padding:6px 18px; font-size:13px; color:#888; }
+.client-block { margin-top:22px; }
+.client-lbl { font-size:11px; color:#555; letter-spacing:2px; text-transform:uppercase; margin-bottom:4px; }
+.client-nm-input { background:none; border:none; border-bottom:2px solid #2a2a3a; color:#fff; font-size:32px; font-weight:700; outline:none; font-family:inherit; width:100%; max-width:500px; padding:2px 0; }
+.client-nm-input:focus { border-bottom-color:#e53e3e; }
+.tags-row { display:flex; gap:10px; margin-top:12px; flex-wrap:wrap; }
+.tag-r { background:#e53e3e18; border:1px solid #e53e3e33; border-radius:6px; padding:5px 14px; font-size:13px; color:#e53e3e; display:flex; align-items:center; gap:4px; }
+.tag-g { background:#48bb7818; border:1px solid #48bb7833; border-radius:6px; padding:5px 14px; font-size:13px; color:#48bb78; display:flex; align-items:center; gap:4px; }
+.tag-input { background:none; border:none; color:inherit; font-size:13px; font-family:inherit; outline:none; min-width:80px; max-width:200px; }
+
+/* ─── SEÇÕES ─── */
+.sec { padding:28px 40px; }
+.sec-t { font-size:11px; font-weight:700; color:#555; letter-spacing:2.5px; text-transform:uppercase; margin-bottom:18px; display:flex; align-items:center; gap:10px; }
+.sec-t::after { content:''; flex:1; height:1px; background:#1a1a2a; }
+
+/* ─── KPIs ─── */
+.kpi-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; }
+.kpi { background:#12121f; border:1px solid #1e1e2e; border-radius:14px; padding:20px 18px; }
+.kpi.red   { border-top:3px solid #e53e3e; }
+.kpi.green { border-top:3px solid #48bb78; }
+.kpi.blue  { border-top:3px solid #4299e1; }
+.kpi.yellow{ border-top:3px solid #ecc94b; }
+.kpi-emoji { font-size:24px; margin-bottom:8px; display:block; }
+.kpi-lbl   { font-size:13px; color:#888; margin-bottom:6px; line-height:1.4; }
+.kpi-val   { font-size:30px; font-weight:800; color:#fff; line-height:1.1; }
+.kpi-val input { background:none; border:none; border-bottom:1px dashed #333; color:#fff; font-size:28px; font-weight:800; width:100%; outline:none; font-family:inherit; }
+.kpi-val input:focus { border-bottom-color:#e53e3e; }
+.kpi-note input { background:none; border:none; color:#555; font-size:12px; width:100%; outline:none; font-family:inherit; margin-top:6px; }
+.kpi-note input:focus { color:#48bb78; }
+
+/* ─── ORÇAMENTO ─── */
+.orc-card { background:#12121f; border:1px solid #1e1e2e; border-radius:14px; overflow:hidden; }
+.orc-header { background:#16162a; border-bottom:1px solid #1e1e2e; padding:18px 24px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; }
+.orc-header-left { display:flex; align-items:center; gap:10px; }
+.orc-icon { font-size:22px; }
+.orc-title { font-size:15px; font-weight:700; color:#e8e8f0; }
+.orc-period input { background:none; border:none; color:#555; font-size:12px; font-family:inherit; outline:none; width:180px; margin-top:2px; }
+.orc-status { display:flex; align-items:center; gap:6px; background:#48bb7812; border:1px solid #48bb7830; border-radius:20px; padding:5px 14px; font-size:12px; color:#48bb78; font-weight:700; }
+.orc-status.over { background:#e53e3e12; border-color:#e53e3e30; color:#fc8181; }
+.status-dot { width:7px; height:7px; border-radius:50%; background:currentColor; }
+.orc-inputs { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:#1e1e2e; }
+.orc-input-cell { background:#12121f; padding:22px 24px; }
+.orc-input-lbl { font-size:11px; color:#555; letter-spacing:1px; text-transform:uppercase; margin-bottom:10px; }
+.orc-input-val { display:flex; align-items:baseline; gap:4px; }
+.orc-input-prefix { font-size:16px; color:#666; font-weight:600; }
+.orc-input-field { background:none; border:none; border-bottom:2px dashed #2a2a3a; color:#fff; font-size:32px; font-weight:800; font-family:inherit; outline:none; width:100%; padding:2px 0; }
+.orc-input-field:focus { border-bottom-color:#e53e3e; }
+.orc-input-field.meta:focus { border-bottom-color:#4299e1; }
+.orc-input-hint { font-size:12px; color:#444; margin-top:6px; }
+.orc-progress-area { padding:20px 24px; border-bottom:1px solid #1a1a2a; }
+.orc-progress-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+.orc-progress-lbl { font-size:13px; color:#888; }
+.orc-progress-pct { font-size:18px; font-weight:800; color:#fff; }
+.progress-bar-bg { background:#1a1a2a; border-radius:99px; height:14px; overflow:hidden; }
+.progress-bar-fill { height:100%; border-radius:99px; transition:width .4s ease,background .4s ease; }
+.progress-ticks { display:flex; justify-content:space-between; margin-top:8px; }
+.progress-tick { font-size:11px; color:#444; }
+.orc-results { display:grid; grid-template-columns:1fr 1fr 1fr; gap:1px; background:#1e1e2e; }
+.orc-result-cell { background:#12121f; padding:20px 24px; }
+.orc-result-lbl { font-size:12px; color:#666; margin-bottom:8px; }
+.orc-result-val { font-size:26px; font-weight:800; }
+.orc-result-val.green { color:#48bb78; }
+.orc-result-val.red   { color:#fc8181; }
+.orc-result-val.blue  { color:#63b3ed; }
+.orc-result-sub { font-size:12px; color:#444; margin-top:5px; }
+.orc-acum { background:#0d1a2a; border-top:1px solid #1e3a5f; padding:20px 24px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px; }
+.orc-acum-lbl { font-size:12px; color:#4299e1; font-weight:700; letter-spacing:.5px; text-transform:uppercase; margin-bottom:5px; }
+.orc-acum-desc { font-size:12px; color:#555; }
+.orc-acum-num { font-size:38px; font-weight:800; color:#63b3ed; }
+.orc-acum-sub { font-size:12px; color:#4299e1; margin-top:3px; text-align:right; }
+
+/* ─── CAMPANHAS ─── */
+.camp-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:14px; }
+.camp-card { background:#12121f; border:1px solid #1e1e2e; border-radius:14px; padding:18px 20px; position:relative; overflow:hidden; }
+.camp-card.top::before   { content:''; position:absolute; top:0; left:0; right:0; height:3px; background:#ecc94b; }
+.camp-card.top   { border-color:#ecc94b44; }
+.camp-card.green::before { content:''; position:absolute; top:0; left:0; right:0; height:3px; background:#48bb78; }
+.camp-card.green { border-color:#48bb7844; }
+.camp-card.blue::before  { content:''; position:absolute; top:0; left:0; right:0; height:3px; background:#4299e1; }
+.camp-card.blue  { border-color:#4299e144; }
+.camp-badge { display:inline-flex; align-items:center; gap:5px; border-radius:20px; padding:4px 12px; font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; margin-bottom:12px; }
+.camp-badge.ouro  { background:#ecc94b18; color:#ecc94b; border:1px solid #ecc94b33; }
+.camp-badge.verde { background:#48bb7818; color:#48bb78; border:1px solid #48bb7833; }
+.camp-badge.azul  { background:#4299e118; color:#4299e1; border:1px solid #4299e133; }
+.camp-badge input { background:none; border:none; color:inherit; font-size:11px; font-weight:700; font-family:inherit; outline:none; width:170px; letter-spacing:.5px; text-transform:uppercase; }
+.camp-name input { background:none; border:none; border-bottom:1px dashed #2a2a3a; color:#e8e8f0; font-size:15px; font-weight:700; font-family:inherit; outline:none; width:100%; padding:2px 0; margin-bottom:12px; }
+.camp-metrics { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
+.camp-metric { background:#0d0d14; border-radius:10px; padding:12px; }
+.camp-metric-lbl input { background:none; border:none; color:#555; font-size:11px; font-family:inherit; outline:none; width:100%; margin-bottom:4px; display:block; }
+.camp-metric-val input { background:none; border:none; border-bottom:1px dashed #2a2a3a; color:#fff; font-size:18px; font-weight:800; font-family:inherit; outline:none; width:100%; }
+.camp-metric-val.destaque input { color:#48bb78; }
+.camp-footer input { background:none; border:none; color:#555; font-size:12px; font-family:inherit; outline:none; width:100%; margin-top:12px; padding-top:12px; border-top:1px solid #1a1a2a; display:block; }
+
+/* ─── INSTAGRAM ─── */
+.ig-block { background:#12121f; border:1px solid #1e1e2e; border-radius:14px; overflow:hidden; }
+.ig-header { background:linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045); padding:20px 26px; display:flex; align-items:center; gap:16px; }
+.ig-logo { width:48px; height:48px; background:rgba(255,255,255,.15); border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:26px; }
+.ig-title { font-size:18px; font-weight:700; color:#fff; }
+.ig-handle input { background:none; border:none; border-bottom:1px dashed rgba(255,255,255,.35); color:rgba(255,255,255,.85); font-size:13px; font-family:inherit; outline:none; width:200px; margin-top:3px; }
+.ig-body { padding:22px 26px; }
+.ig-stats { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:22px; }
+.ig-stat { background:#0d0d14; border:1px solid #1e1e2e; border-radius:12px; padding:18px; text-align:center; }
+.ig-stat.main { border-color:#833ab455; }
+.ig-stat-emoji { font-size:26px; margin-bottom:8px; }
+.ig-stat-lbl { font-size:12px; color:#666; margin-bottom:8px; line-height:1.4; }
+.ig-stat-val input { background:none; border:none; border-bottom:2px dashed #2a2a3a; color:#fff; font-size:30px; font-weight:800; width:140px; outline:none; font-family:inherit; text-align:center; }
+.ig-stat-val input:focus { border-bottom-color:#fd1d1d; }
+.ig-stat-sub input { background:none; border:none; color:#555; font-size:12px; font-family:inherit; outline:none; width:100%; text-align:center; margin-top:6px; }
+.ig-stat-full { grid-column:1/-1; background:#0d0d1a; border:2px solid #48bb7833; border-radius:12px; padding:22px; text-align:center; }
+.ig-novos-num { font-size:52px; font-weight:800; color:#48bb78; margin:8px 0 6px; line-height:1; }
+.ig-novos-msg { font-size:14px; color:#48bb78; }
+.ig-chart-lbl { font-size:12px; color:#555; margin-bottom:12px; }
+
+/* ─── GRÁFICOS ─── */
+.chart-card { background:#12121f; border:1px solid #1e1e2e; border-radius:14px; padding:22px; }
+.chart-ttl { font-size:15px; font-weight:700; color:#ccc; margin-bottom:5px; }
+.chart-sub { font-size:12px; color:#555; margin-bottom:16px; }
+
+/* ─── TAREFAS ─── */
+.tasks-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:12px; }
+.task-item { background:#12121f; border:1px solid #1e1e2e; border-radius:12px; padding:14px 16px; display:flex; align-items:flex-start; gap:12px; cursor:pointer; user-select:none; transition:border-color .15s; }
+.task-item.done { border-color:#48bb7855; background:#48bb780a; }
+.task-check { width:22px; height:22px; border:2px solid #333; border-radius:6px; flex-shrink:0; position:relative; transition:all .15s; margin-top:2px; }
+.task-item.done .task-check { background:#48bb78; border-color:#48bb78; }
+.task-check::after { content:'✓'; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); font-size:13px; color:#fff; font-weight:800; opacity:0; }
+.task-item.done .task-check::after { opacity:1; }
+.task-label { font-size:14px; color:#999; flex:1; line-height:1.5; }
+.task-item.done .task-label { color:#ccc; }
+/* INPUT VISÍVEL COMPLETO */
+.task-label input { background:none; border:none; color:inherit; font-size:14px; font-family:inherit; outline:none; width:100%; white-space:normal; word-break:break-word; }
+.task-label input::placeholder { color:#444; }
+.task-del { color:#333; font-size:14px; cursor:pointer; padding:2px 4px; flex-shrink:0; display:none; }
+.task-item:hover .task-del { display:block; }
+.task-del:hover { color:#e53e3e; }
+.add-btn { background:none; border:2px dashed #2a2a3a; border-radius:12px; color:#555; font-size:14px; padding:14px; width:100%; cursor:pointer; transition:all .15s; font-family:inherit; display:flex; align-items:center; justify-content:center; gap:6px; margin-top:12px; }
+.add-btn:hover { border-color:#e53e3e; color:#e53e3e; }
+
+/* ─── CONQUISTAS ─── */
+.wins-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:12px; }
+.win-card { background:#12121f; border:1px solid #1e1e2e; border-radius:12px; padding:18px; }
+.win-emoji-input { background:none; border:none; font-size:28px; width:40px; outline:none; margin-bottom:10px; display:block; }
+.win-title-input { background:none; border:none; border-bottom:1px dashed #2a2a3a; color:#e8e8f0; font-size:15px; font-weight:700; font-family:inherit; outline:none; width:100%; padding:1px 0; margin-bottom:6px; }
+.win-desc-input { background:none; border:none; border-bottom:1px dashed #2a2a3a; color:#666; font-size:13px; font-family:inherit; outline:none; width:100%; padding:1px 0; }
+
+/* ─── MENSAGEM ─── */
+.msg-card { background:#12121f; border:1px solid #1e1e2e; border-radius:14px; padding:22px; }
+.msg-header { display:flex; align-items:center; gap:14px; margin-bottom:16px; }
+.msg-avatar { width:42px; height:42px; background:#e53e3e; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:16px; color:#fff; flex-shrink:0; }
+.msg-name-input { background:none; border:none; border-bottom:1px dashed #333; color:#ccc; font-size:14px; font-weight:700; outline:none; font-family:inherit; width:180px; }
+.msg-role { font-size:12px; color:#555; margin-top:3px; }
+.msg-text textarea { background:none; border:none; color:#bbb; font-size:14px; width:100%; resize:vertical; outline:none; font-family:inherit; line-height:1.85; min-height:100px; }
+.msg-text textarea::placeholder { color:#444; }
+
+/* ─── PRÓXIMOS PASSOS ─── */
+.next-list { list-style:none; }
+.next-item { display:flex; align-items:center; gap:12px; padding:12px 0; border-bottom:1px solid #1a1a2a; }
+.next-item:last-child { border-bottom:none; }
+.next-arrow { color:#e53e3e; font-size:18px; flex-shrink:0; }
+.next-item input { background:none; border:none; border-bottom:1px dashed #2a2a3a; color:#ccc; font-size:14px; flex:1; padding:2px 0; outline:none; font-family:inherit; }
+.next-item input:focus { border-bottom-color:#e53e3e; color:#fff; }
+.next-item input::placeholder { color:#444; }
+
+/* ─── HINT ─── */
+.hint { font-size:11px; color:#3a3a4a; text-align:center; padding:8px 0 16px; }
+
+/* ─── FOOTER ─── */
+.footer { background:#0a0a0f; border-top:1px solid #1a1a2a; padding:18px 40px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; }
+.footer-l { font-size:12px; color:#444; }
+.btn-clear { background:#1a1a2e; color:#888; border:1.5px solid #2a2a3a; border-radius:10px; padding:10px 24px; font-size:13px; font-weight:700; cursor:pointer; }
+.btn-clear:hover { background:#2a1a1a; border-color:#e53e3e55; color:#fc8181; }
+.btn-lock { background:#1a1a2e; color:#ecc94b; border:1.5px solid #ecc94b44; border-radius:10px; padding:10px 24px; font-size:13px; font-weight:700; cursor:pointer; }
+.btn-lock:hover { background:#ecc94b18; border-color:#ecc94b; }
+
+/* MODO CLIENTE — trava tudo */
+body.modo-cliente input,
+body.modo-cliente textarea { pointer-events:none !important; user-select:none !important; border-color:transparent !important; cursor:default !important; }
+body.modo-cliente .add-btn,
+body.modo-cliente .hint,
+body.modo-cliente .task-del,
+body.modo-cliente .btn-export,
+body.modo-cliente .btn-lock,
+body.modo-cliente .btn-clear { display:none !important; }
+body.modo-cliente .task-item { cursor:default !important; pointer-events:none !important; }
+body.modo-cliente .client-nm-input { border-bottom-color:transparent !important; }
+
+/* ─── PRINT ─── */
+@media print {
+  .hint, .add-btn, .btn-print, .task-del { display:none !important; }
+  body { background:#0d0d14; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  .sec { padding:20px 30px; }
+  .hero { padding:20px 30px 18px; }
+  .footer { padding:12px 30px; }
+  /* KPIs maiores no print */
+  .kpi-val, .kpi-val input { font-size:32px !important; }
+  .kpi-lbl { font-size:14px !important; }
+  .orc-result-val { font-size:28px !important; }
+  .orc-acum-num { font-size:40px !important; }
+  .ig-novos-num { font-size:56px !important; }
+  /* Tarefas: texto completo visível */
+  .task-label input { white-space:normal !important; overflow:visible !important; text-overflow:unset !important; }
+  .task-item { page-break-inside:avoid; }
+}
+
+@media (max-width:600px) {
+  .hero,.sec,.footer { padding-left:16px; padding-right:16px; }
+  .ig-stats,.orc-inputs,.orc-results { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body id="artifacts-component-root-html" class="modo-cliente">
+
+<!-- HERO -->
+<div class="hero">
+  <div class="logo-row">
+    <img class="logo-img" src="data:image/png;base64,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" alt="Rabbit Assessoria">
+    <div class="period-pill"><span id="disp-period">junho de 2026</span></div>
+  </div>
+  <div class="client-block">
+    <div class="client-lbl">Relatório para</div>
+    <input class="client-nm-input" placeholder="Nome do cliente" value="Labelessence">
+    <div class="tags-row">
+      <span class="tag-r">📅 <input class="tag-input" placeholder="Ex: Junho 2026" oninput="document.getElementById('disp-period').textContent=this.value||'Mês / Ano'" style="color:#e53e3e;" value="junho de 2026"></span>
+      <span class="tag-g">✅ <input class="tag-input" placeholder="1º mês de parceria" style="color:#48bb78;" value=""></span>
+    </div>
+  </div>
+</div>
+
+<!-- NÚMEROS DO MÊS -->
+<div class="sec">
+  <div class="sec-t">os números do mês</div>
+  <div class="kpi-row">
+    <div class="kpi red"><span class="kpi-emoji">💰</span><div class="kpi-lbl">Valor investido em anúncios</div><div class="kpi-val">R$ <input placeholder="0,00" value="680,51"></div><div class="kpi-note"><input placeholder="quanto foi gasto nos anúncios" value=""></div></div>
+    <div class="kpi green"><span class="kpi-emoji">📩</span><div class="kpi-lbl">Pessoas que entraram em contato</div><div class="kpi-val"><input placeholder="0" value="158"></div><div class="kpi-note"><input placeholder="contatos recebidos no mês" value=""></div></div>
+    <div class="kpi blue"><span class="kpi-emoji">👀</span><div class="kpi-lbl">Pessoas que viram seus anúncios</div><div class="kpi-val"><input placeholder="0" value="51.821"></div><div class="kpi-note"><input placeholder="alcance total do mês" value=""></div></div>
+    <div class="kpi yellow"><span class="kpi-emoji">💸</span><div class="kpi-lbl">Custo por contato</div><div class="kpi-val">R$ <input placeholder="0,00" value="3,31"></div><div class="kpi-note"><input placeholder="quanto custou cada contato" value=""></div></div>
+  </div>
+  
+</div>
+
+<!-- ORÇAMENTO -->
+<div class="sec" style="padding-top:0;">
+  <div class="sec-t">controle de orçamento</div>
+  <div class="orc-card">
+    <div class="orc-header">
+      <div class="orc-header-left"><span class="orc-icon">📊</span><div><div class="orc-title">Orçamento mensal</div><div class="orc-period"><input placeholder="Ex: Junho 2026" value=""></div></div></div>
+      <div class="orc-status" id="orc-status" style="background: rgba(236, 201, 75, 0.07); border-color: rgba(236, 201, 75, 0.19); color: rgb(236, 201, 75);"><span class="status-dot"></span><span id="status-txt">Quase no limite</span></div>
+    </div>
+    <div class="orc-inputs">
+      <div class="orc-input-cell"><div class="orc-input-lbl">🎯 Meta de orçamento</div><div class="orc-input-val"><span class="orc-input-prefix">R$</span><input class="orc-input-field meta" id="inp-meta" placeholder="800,00" oninput="calcOrc()" value="800"></div><div class="orc-input-hint">valor combinado com o cliente por mês</div></div>
+      <div class="orc-input-cell"><div class="orc-input-lbl">💸 Valor gasto este mês</div><div class="orc-input-val"><span class="orc-input-prefix">R$</span><input class="orc-input-field" id="inp-gasto" placeholder="0,00" oninput="calcOrc()" value="680,51"></div><div class="orc-input-hint">total investido nas campanhas</div></div>
+    </div>
+    <div class="orc-progress-area">
+      <div class="orc-progress-header"><span class="orc-progress-lbl">Utilização do orçamento</span><span class="orc-progress-pct" id="pct-txt">85.1%</span></div>
+      <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-fill" style="width: 85.1%; background: rgb(236, 201, 75);"></div></div>
+      <div class="progress-ticks"><span class="progress-tick">R$ 0</span><span class="progress-tick" id="tick-mid">R$ 400,00</span><span class="progress-tick" id="tick-end">R$ 800,00</span></div>
+    </div>
+    <div class="orc-results">
+      <div class="orc-result-cell"><div class="orc-result-lbl">✅ Gasto</div><div class="orc-result-val" id="res-gasto">R$ 680,51</div><div class="orc-result-sub">investido este mês</div></div>
+      <div class="orc-result-cell"><div class="orc-result-lbl">💚 Saldo restante</div><div class="orc-result-val green" id="res-saldo">R$ 119,49</div><div class="orc-result-sub" id="res-saldo-sub">não utilizado este mês</div></div>
+      <div class="orc-result-cell"><div class="orc-result-lbl">📅 Meta do mês</div><div class="orc-result-val blue" id="res-meta">R$ 800,00</div><div class="orc-result-sub">orçamento combinado</div></div>
+    </div>
+    <div class="orc-acum">
+      <div><div class="orc-acum-lbl">🚀 Crédito acumulado para o próximo mês</div><div class="orc-acum-desc" id="acum-desc">O saldo não utilizado é somado à meta do próximo mês</div></div>
+      <div style="text-align:right;"><div class="orc-acum-num" id="acum-val" style="color: rgb(99, 179, 237);">R$ 919,49</div><div class="orc-acum-sub" id="acum-sub">meta (R$ 800,00) + saldo (R$ 119,49)</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- CAMPANHAS -->
+<div class="sec" style="padding-top:0;">
+  <div class="sec-t">campanhas em destaque</div>
+  <div class="camp-grid" id="camp-container"><div class="camp-card top"><span class="camp-badge ouro"><input value="🏆 Melhor resultado"></span>
+    <div class="camp-name"><input value="Combo Dias dos Namorados" placeholder="Nome da campanha"></div>
+    <div class="camp-metrics">
+      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Contatos"></div><div class="camp-metric-val destaque"><input value="70" placeholder="0"></div></div>
+      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Custo por contato"></div><div class="camp-metric-val destaque"><input value="R$ 1,89" placeholder="0"></div></div>
+    </div>
+    <div class="camp-footer"><input value="Campanha com melhor custo por contato do mês" placeholder="Observação sobre esta campanha"></div></div><div class="camp-card green"><span class="camp-badge verde"><input value="👥 Maior alcance"></span>
+    <div class="camp-name"><input value="Pren Lábios — Visita ao Perfil" placeholder="Nome da campanha"></div>
+    <div class="camp-metrics">
+      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Pessoas alcançadas"></div><div class="camp-metric-val"><input value="24.411" placeholder="0"></div></div>
+      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Custo por visita"></div><div class="camp-metric-val"><input value="R$ 0,34" placeholder="0"></div></div>
+    </div>
+    <div class="camp-footer"><input value="Campanha que mais levou pessoas ao perfil" placeholder="Observação sobre esta campanha"></div></div><div class="camp-card blue"><span class="camp-badge azul"><input value="📣 Campanha ativa"></span>
+    <div class="camp-name"><input value="Whats — Vídeo Botox" placeholder="Nome da campanha"></div>
+    <div class="camp-metrics">
+      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Contatos"></div><div class="camp-metric-val"><input value="2" placeholder="0"></div></div>
+      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Custo por contato"></div><div class="camp-metric-val"><input value="R$ 2,27" placeholder="0"></div></div>
+    </div>
+    <div class="camp-footer"><input value="Campanha ainda em andamento este mês" placeholder="Observação sobre esta campanha"></div></div></div>
+  
+</div>
+
+<!-- INSTAGRAM -->
+<div class="sec" style="padding-top:0;">
+  <div class="sec-t">instagram — seguidores</div>
+  <div class="ig-block">
+    <div class="ig-header"><div class="ig-logo">📸</div><div><div class="ig-title">Instagram</div><div class="ig-handle">@<input placeholder="perfil do cliente" value="https://www.instagram.com/labelessence/"></div></div></div>
+    <div class="ig-body">
+      <div class="ig-stats">
+        <div class="ig-stat main"><div class="ig-stat-emoji">👥</div><div class="ig-stat-lbl">Seguidores que você tinha antes</div><div class="ig-stat-val"><input placeholder="0" id="ig-antes" oninput="calcFollowers()" value="11.569"></div><div class="ig-stat-sub"><input placeholder="início do mês" value=""></div></div>
+        <div class="ig-stat main"><div class="ig-stat-emoji">📈</div><div class="ig-stat-lbl">Total de seguidores hoje</div><div class="ig-stat-val"><input placeholder="0" id="ig-total" oninput="calcFollowers()" value="11.664"></div><div class="ig-stat-sub"><input placeholder="seguidores agora" value=""></div></div>
+        <div class="ig-stat-full"><div class="ig-stat-emoji" style="font-size:28px;margin-bottom:8px;">🚀</div><div class="ig-stat-lbl" style="font-size:14px;color:#777;margin-bottom:8px;">Novos seguidores conquistados no mês</div><div class="ig-novos-num" id="ig-novos">+95</div><div class="ig-novos-msg" id="ig-novos-msg">novos seguidores conquistados esse mês 🎉</div></div>
+      </div>
+      <div class="ig-chart-lbl">Crescimento ao longo do mês</div>
+      <div style="position:relative;width:100%;height:160px;"><canvas id="cFollowers" width="423" height="160" style="display: block; box-sizing: border-box; height: 160px; width: 423px;"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<!-- CONTATOS POR SEMANA -->
+<div class="sec" style="padding-top:0;">
+  <div class="sec-t">contatos recebidos por semana</div>
+  <div class="chart-card">
+    <div class="chart-ttl">📬 Quantas pessoas chegaram até você</div>
+    <div class="chart-sub">Evolução semana a semana</div>
+    <div style="position:relative;width:100%;height:180px;"><canvas id="cLeads" width="431" height="180" style="display: block; box-sizing: border-box; height: 180px; width: 431px;"></canvas></div>
+  </div>
+</div>
+
+<!-- MICROTAREFAS -->
+<div class="sec" style="padding-top:0;">
+  <div class="sec-t">tudo que foi feito este mês</div>
+  <div class="tasks-grid" id="tasks-container"><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Gestão e otimização de anúncios</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Configuração do Google Meu Negócio</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Confecção de 10 criativos (vídeo e imagem)</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Criação do Site Labele</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Configuração da Campanha de WhatsApp</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Configuração total de onboarding</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Estudo de concorrentes próximos</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Aquisição do domínio do site</textarea></div></div><div class="task-item"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;"></textarea></div></div><div class="task-item"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;"></textarea></div></div></div>
+  
+  
+</div>
+
+<!-- CONQUISTAS -->
+<div class="sec" style="padding-top:0;">
+  <div class="sec-t">conquistas em destaque</div>
+  <div class="wins-grid" id="wins-container"><div class="win-card"><input class="win-emoji-input" value="🌐"><input class="win-title-input" placeholder="Título" value="Site no ar"><input class="win-desc-input" placeholder="Breve descrição" value="Sua página está pronta e funcionando"></div><div class="win-card"><input class="win-emoji-input" value="📍"><input class="win-title-input" placeholder="Título" value="Google Meu Negócio"><input class="win-desc-input" placeholder="Breve descrição" value="Você aparece nas buscas do Google"></div><div class="win-card"><input class="win-emoji-input" value="🎨"><input class="win-title-input" placeholder="Título" value="10 criativos prontos"><input class="win-desc-input" placeholder="Breve descrição" value="Artes profissionais para os anúncios"></div><div class="win-card"><input class="win-emoji-input" value="📣"><input class="win-title-input" placeholder="Título" value="Primeiro anúncio no ar"><input class="win-desc-input" placeholder="Breve descrição" value="Sua marca começou a aparecer"></div></div>
+  
+</div>
+
+
+<!-- PRÓXIMOS PASSOS -->
+<div class="sec" style="padding-top:0;">
+  <div class="sec-t">o que vem por aí</div>
+  <div class="msg-card">
+    <ul class="next-list" id="next-list"><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Rankeamento do Google Meu Negócio"></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Campanha de rede de pesquisa do Google que leva para o site"></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Vamos conquistar no mínimo 20 avaliações no Google"></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Vamos criar um dashboard para acompanhar e analisar o Retorno sobre o Investimento (ROI), permitindo visualizar de forma clara os resultados obtidos em relação aos valores investidos."></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Promoção Copa do Mundo + Massagem Relaxante"></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Estruturar um CRM"></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Gravação de 3 criativos humanizado no local!"></li></ul>
+    
+  </div>
+</div>
+
+<div class="footer">
+  <div class="footer-l">Rabbit Assessoria Digital · Relatório mensal personalizado<br><span id="autosave-status" style="font-size:10px;color:#333;"></span></div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;">
+    <button class="btn-clear" onclick="limparDados()">🗑️ Novo cliente</button>
+    
+    <button class="btn-print" onclick="window.print()">🖨️ Exportar PDF</button>
+  </div>
+</div>
+
+<script>
+// ORÇAMENTO
+function parseBR(v){return parseFloat((v||'').replace(/\./g,'').replace(',','.'))||0;}
+function fmtBR(v){return v.toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function calcOrc(){
+  const meta=parseBR(document.getElementById('inp-meta').value);
+  const gasto=parseBR(document.getElementById('inp-gasto').value);
+  if(meta<=0)return;
+  const saldo=meta-gasto, proximo=meta+Math.max(saldo,0), pct=Math.min((gasto/meta)*100,100), over=gasto>meta;
+  const fill=document.getElementById('progress-fill');
+  fill.style.width=pct.toFixed(1)+'%';
+  fill.style.background=over?'#e53e3e':pct>80?'#ecc94b':'#48bb78';
+  document.getElementById('pct-txt').textContent=pct.toFixed(1)+'%';
+  document.getElementById('tick-mid').textContent='R$ '+fmtBR(meta/2);
+  document.getElementById('tick-end').textContent='R$ '+fmtBR(meta);
+  document.getElementById('res-gasto').textContent='R$ '+fmtBR(gasto);
+  document.getElementById('res-meta').textContent='R$ '+fmtBR(meta);
+  const sEl=document.getElementById('res-saldo'),sSub=document.getElementById('res-saldo-sub');
+  if(over){sEl.textContent='- R$ '+fmtBR(Math.abs(saldo));sEl.className='orc-result-val red';sSub.textContent='acima do orçamento';}
+  else{sEl.textContent='R$ '+fmtBR(saldo);sEl.className='orc-result-val green';sSub.textContent='não utilizado este mês';}
+  const aEl=document.getElementById('acum-val'),aSub=document.getElementById('acum-sub'),aDesc=document.getElementById('acum-desc');
+  if(over){aEl.textContent='R$ '+fmtBR(meta);aEl.style.color='#fc8181';aSub.textContent='sem crédito — orçamento excedido';aDesc.textContent='O orçamento foi ultrapassado este mês, sem saldo a acumular';}
+  else{aEl.textContent='R$ '+fmtBR(proximo);aEl.style.color='#63b3ed';aSub.textContent='meta (R$ '+fmtBR(meta)+') + saldo (R$ '+fmtBR(saldo)+')';aDesc.textContent='O saldo não utilizado é somado à meta do próximo mês';}
+  const stEl=document.getElementById('orc-status'),stTxt=document.getElementById('status-txt');
+  if(over){stEl.className='orc-status over';stTxt.textContent='Acima do orçamento';stEl.style.cssText='';}
+  else if(pct>80){stEl.className='orc-status';stEl.style.background='#ecc94b12';stEl.style.borderColor='#ecc94b30';stEl.style.color='#ecc94b';stTxt.textContent='Quase no limite';}
+  else{stEl.className='orc-status';stEl.style.cssText='';stTxt.textContent='Dentro do orçamento';}
+}
+
+// CAMPANHAS
+const camps=[
+  {badge:'ouro',badgeTxt:'🏆 Melhor resultado',cls:'top',name:'Combo Dias dos Namorados',m1lbl:'Contatos',m1val:'70',m2lbl:'Custo por contato',m2val:'R$ 1,89',dest:true,rodape:'Campanha com melhor custo por contato do mês'},
+  {badge:'verde',badgeTxt:'👥 Maior alcance',cls:'green',name:'Pren Lábios — Visita ao Perfil',m1lbl:'Pessoas alcançadas',m1val:'24.411',m2lbl:'Custo por visita',m2val:'R$ 0,34',dest:false,rodape:'Campanha que mais levou pessoas ao perfil'},
+  {badge:'azul',badgeTxt:'📣 Campanha ativa',cls:'blue',name:'Whats — Vídeo Botox',m1lbl:'Contatos',m1val:'2',m2lbl:'Custo por contato',m2val:'R$ 2,27',dest:false,rodape:'Campanha ainda em andamento este mês'},
+];
+function renderCamps(){
+  const c=document.getElementById('camp-container');c.innerHTML='';
+  camps.forEach((cp,i)=>{
+    const d=document.createElement('div');d.className='camp-card '+cp.cls;
+    d.innerHTML=`<span class="camp-badge ${cp.badge}"><input value="${cp.badgeTxt}" /></span>
+    <div class="camp-name"><input value="${cp.name}" placeholder="Nome da campanha"/></div>
+    <div class="camp-metrics">
+      <div class="camp-metric"><div class="camp-metric-lbl"><input value="${cp.m1lbl}"/></div><div class="camp-metric-val${cp.dest?' destaque':''}"><input value="${cp.m1val}" placeholder="0"/></div></div>
+      <div class="camp-metric"><div class="camp-metric-lbl"><input value="${cp.m2lbl}"/></div><div class="camp-metric-val${cp.dest?' destaque':''}"><input value="${cp.m2val}" placeholder="0"/></div></div>
+    </div>
+    <div class="camp-footer"><input value="${cp.rodape}" placeholder="Observação sobre esta campanha"/></div>`;
+    c.appendChild(d);
+  });
+}
+renderCamps();
+function addCamp(){camps.push({badge:'azul',badgeTxt:'📌 Campanha',cls:'blue',name:'',m1lbl:'Resultado',m1val:'',m2lbl:'Custo',m2val:'',dest:false,rodape:''});renderCamps();}
+
+// SEGUIDORES
+function calcFollowers(){
+  const total=parseInt((document.getElementById('ig-total').value||'').replace(/\D/g,''))||0;
+  const antes=parseInt((document.getElementById('ig-antes').value||'').replace(/\D/g,''))||0;
+  const novos=total-antes;
+  const el=document.getElementById('ig-novos'),msg=document.getElementById('ig-novos-msg');
+  if(total>0&&antes>0&&novos>=0){el.textContent='+'+novos.toLocaleString('pt-BR');msg.textContent='novos seguidores conquistados esse mês 🎉';}
+  else{el.textContent='—';msg.textContent='Preencha os campos acima para calcular automaticamente';}
+}
+
+// GRÁFICOS
+new Chart(document.getElementById('cFollowers'),{type:'line',data:{labels:['Início','Sem 1','Sem 2','Sem 3','Sem 4'],datasets:[{data:[820,890,940,1010,1080],borderColor:'#fd1d1d',backgroundColor:'rgba(253,29,29,0.06)',borderWidth:2.5,pointBackgroundColor:'#fd1d1d',pointRadius:5,tension:0.4,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#666',font:{size:12}},grid:{color:'#1e1e2e'}},y:{ticks:{color:'#666',font:{size:12}},grid:{color:'#1e1e2e'}}}}});
+new Chart(document.getElementById('cLeads'),{type:'line',data:{labels:['Semana 1','Semana 2','Semana 3','Semana 4'],datasets:[{data:[3,7,11,18],borderColor:'#48bb78',backgroundColor:'rgba(72,187,120,0.07)',borderWidth:2.5,pointBackgroundColor:'#48bb78',pointRadius:6,tension:0.4,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#666',font:{size:12}},grid:{color:'#1e1e2e'}},y:{ticks:{color:'#666',font:{size:12}},grid:{color:'#1e1e2e'},beginAtZero:true}}}});
+
+// TAREFAS — textarea em vez de input para texto longo visível completo
+const tasks=[
+  {label:'Gestão e otimização de anúncios',done:true},
+  {label:'Configuração do Google Meu Negócio',done:true},
+  {label:'Confecção de 10 criativos (vídeo e imagem)',done:true},
+  {label:'Criação do Site Labele',done:true},
+  {label:'Configuração da Campanha de WhatsApp',done:true},
+  {label:'Configuração total de onboarding',done:true},
+  {label:'Estudo de concorrentes próximos',done:true},
+  {label:'Aquisição do domínio do site',done:true},
+  {label:'',done:false},
+  {label:'',done:false},
+];
+function renderTasks(){
+  const c=document.getElementById('tasks-container');c.innerHTML='';
+  tasks.forEach((t,i)=>{
+    const d=document.createElement('div');d.className='task-item'+(t.done?' done':'');
+    d.innerHTML=`<div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">${t.label}</textarea></div><span class="task-del" onclick="event.stopPropagation();removeTask(${i})">✕</span>`;
+    d.querySelector('.task-check').addEventListener('click',()=>{tasks[i].done=!tasks[i].done;renderTasks();});
+    d.querySelector('textarea').addEventListener('change',e=>{tasks[i].label=e.target.value;});
+    d.querySelector('textarea').addEventListener('click',e=>e.stopPropagation());
+    c.appendChild(d);
+  });
+}
+renderTasks();
+function addTask(){tasks.push({label:'',done:false});renderTasks();}
+function removeTask(i){tasks.splice(i,1);renderTasks();}
+
+// CONQUISTAS
+const wins=[
+  {emoji:'🌐',title:'Site no ar',desc:'Sua página está pronta e funcionando'},
+  {emoji:'📍',title:'Google Meu Negócio',desc:'Você aparece nas buscas do Google'},
+  {emoji:'🎨',title:'10 criativos prontos',desc:'Artes profissionais para os anúncios'},
+  {emoji:'📣',title:'Primeiro anúncio no ar',desc:'Sua marca começou a aparecer'},
+];
+function renderWins(){
+  const c=document.getElementById('wins-container');c.innerHTML='';
+  wins.forEach(w=>{
+    const d=document.createElement('div');d.className='win-card';
+    d.innerHTML=`<input class="win-emoji-input" value="${w.emoji}"/><input class="win-title-input" placeholder="Título" value="${w.title.replace(/"/g,'&quot;')}"/><input class="win-desc-input" placeholder="Breve descrição" value="${w.desc.replace(/"/g,'&quot;')}"/>`;
+    c.appendChild(d);
+  });
+}
+renderWins();
+function addWin(){wins.push({emoji:'⭐',title:'',desc:''});renderWins();}
+
+function addNext(){
+  const li=document.createElement('li');li.className='next-item';
+  li.innerHTML='<span class="next-arrow">→</span><input placeholder="Próximo passo..."/>';
+  document.getElementById('next-list').appendChild(li);
+}
+
+// ─── MODO CLIENTE (leitura) ───
+// Ativa automaticamente se a URL tiver ?modo=cliente
+(function(){
+  if(new URLSearchParams(window.location.search).get('modo')==='cliente'){
+    document.body.classList.add('modo-cliente');
+  }
+})();
+
+function coletarDados() {
+  const clone = document.documentElement.cloneNode(true);
+
+  // Helper: getElementById não existe em elementos, usar querySelector
+  const cid = (id) => clone.querySelector('#' + id);
+
+  // Inputs e textareas
+  const origInputs = document.querySelectorAll('input, textarea');
+  const cloneInputs = clone.querySelectorAll('input, textarea');
+  origInputs.forEach((el,i)=>{
+    if(!cloneInputs[i]) return;
+    if(el.tagName==='TEXTAREA') cloneInputs[i].textContent=el.value;
+    else cloneInputs[i].setAttribute('value',el.value);
+  });
+
+  // Elementos calculados dinamicamente
+  const dynamicIds=['disp-period','ig-novos','ig-novos-msg','pct-txt','res-gasto','res-saldo','res-saldo-sub','res-meta','acum-val','acum-sub','acum-desc','status-txt','tick-mid','tick-end'];
+  dynamicIds.forEach(id=>{
+    const o=document.getElementById(id), c=cid(id);
+    if(o&&c) c.textContent=o.textContent;
+  });
+
+  // Barra de progresso
+  const oFill=document.getElementById('progress-fill'), cFill=cid('progress-fill');
+  if(oFill&&cFill){cFill.style.width=oFill.style.width;cFill.style.background=oFill.style.background;}
+
+  // Status orçamento
+  const oStatus=document.getElementById('orc-status'), cStatus=cid('orc-status');
+  if(oStatus&&cStatus){cStatus.className=oStatus.className;cStatus.style.cssText=oStatus.style.cssText;}
+
+  // Seções dinâmicas
+  ['tasks-container','camp-container','wins-container','next-list'].forEach(id=>{
+    const o=document.getElementById(id), c=cid(id);
+    if(o&&c) c.innerHTML=o.innerHTML;
+  });
+
+  return clone;
+}
+
+function gerarLinkCliente(){
+  const clone = coletarDados();
+
+  // Trava o body
+  clone.querySelector('body').classList.add('modo-cliente');
+
+  // Remove os botões de edição do clone
+  clone.querySelectorAll('.btn-export,.btn-lock,.add-btn,.hint,.task-del').forEach(el=>el.remove());
+
+  const html = '<!DOCTYPE html>\n' + clone.outerHTML;
+
+  // Tenta Blob download (funciona em servidor / GitHub Pages)
+  try {
+    const blob = new Blob([html],{type:'text/html;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const clienteNome = document.querySelector('.client-nm-input')?.value || 'cliente';
+    const periodo = document.getElementById('disp-period')?.textContent || 'relatorio';
+    a.download = `relatorio_CLIENTE_${clienteNome}_${periodo}.html`
+      .toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9\-_.]/g,'');
+    a.href = url;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url), 1000);
+  } catch(e) {
+    // Fallback: abre em nova aba para o usuário salvar manualmente
+    const w = window.open('','_blank');
+    w.document.write(html);
+    w.document.close();
+    alert('⚠️ Seu navegador não suportou o download direto.\n\nNa nova aba que abriu:\n1. Pressione Ctrl+S (ou Cmd+S no Mac)\n2. Salve como arquivo HTML\n3. Suba esse arquivo no GitHub Pages');
+    return;
+  }
+
+  // Feedback visual
+  const btn = document.querySelector('.btn-lock');
+  const orig = btn.innerHTML;
+  btn.innerHTML = '✅ Arquivo gerado!';
+  btn.style.color = '#48bb78';
+  setTimeout(()=>{btn.innerHTML=orig;btn.style.color='';},2500);
+}
+
+// ─── EXPORTAR HTML EDITÁVEL ───
+function exportHTML() {
+  const clone = coletarDados();
+  const clienteNome = document.querySelector('.client-nm-input')?.value || 'cliente';
+  const periodo = document.getElementById('disp-period')?.textContent || 'relatorio';
+  const nomeArquivo = ('relatorio_' + clienteNome + '_' + periodo + '.html')
+    .toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9\-_.]/g,'');
+  const html = '<!DOCTYPE html>\n' + clone.outerHTML;
+  try {
+    const blob = new Blob([html],{type:'text/html;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = nomeArquivo;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  } catch(e) {
+    const w = window.open('','_blank');
+    w.document.write(html); w.document.close();
+    alert('Salve a nova aba com Ctrl+S para guardar o arquivo editável.');
+  }
+}
+
+// ═══════════════════════════════════════════════
+// AUTOSAVE & AUTOLOAD — localStorage
+// ═══════════════════════════════════════════════
+const STORAGE_KEY = 'rabbit_relatorio_v2';
+
+function coletarEstado() {
+  const estado = { inputs: {}, tarefas: [], campanhas: [], conquistas: [], proxPassos: [] };
+
+  // Inputs com id
+  document.querySelectorAll('input[id], textarea[id]').forEach(el => {
+    estado.inputs[el.id] = el.value;
+  });
+
+  // Inputs sem id — por índice
+  const allInputs = [...document.querySelectorAll('input:not([id]), textarea:not([id])')];
+  allInputs.forEach((el, i) => { estado.inputs['_idx_' + i] = el.value; });
+
+  // Tarefas (do array em memória)
+  tasks.forEach(t => estado.tarefas.push({ label: t.label, done: t.done }));
+
+  // Campanhas (lê do DOM para pegar edições)
+  document.querySelectorAll('#camp-container .camp-card').forEach(card => {
+    const inp = card.querySelectorAll('input');
+    estado.campanhas.push({
+      cls: card.className.includes('top') ? 'top' : card.className.includes('green') ? 'green' : 'blue',
+      badge: card.className.includes('top') ? 'ouro' : card.className.includes('green') ? 'verde' : 'azul',
+      badgeTxt: inp[0]?.value||'', name: inp[1]?.value||'',
+      m1lbl: inp[2]?.value||'', m1val: inp[3]?.value||'',
+      m2lbl: inp[4]?.value||'', m2val: inp[5]?.value||'',
+      rodape: inp[6]?.value||'', dest: !!card.querySelector('.destaque')
+    });
+  });
+
+  // Conquistas
+  document.querySelectorAll('#wins-container .win-card').forEach(card => {
+    const inp = card.querySelectorAll('input');
+    estado.conquistas.push({ emoji: inp[0]?.value||'⭐', title: inp[1]?.value||'', desc: inp[2]?.value||'' });
+  });
+
+  // Próximos passos
+  document.querySelectorAll('#next-list .next-item input').forEach(el => estado.proxPassos.push(el.value));
+
+  return estado;
+}
+
+function aplicarEstado(estado) {
+  if (!estado) return;
+
+  // Inputs com id
+  if (estado.inputs) {
+    Object.entries(estado.inputs).forEach(([id, val]) => {
+      if (id.startsWith('_idx_')) return;
+      const el = document.getElementById(id);
+      if (el) { el.value = val; el.dispatchEvent(new Event('input')); }
+    });
+  }
+
+  // Tarefas
+  if (estado.tarefas?.length) {
+    tasks.length = 0;
+    estado.tarefas.forEach(t => tasks.push({ label: t.label, done: t.done }));
+    renderTasks();
+  }
+
+  // Campanhas
+  if (estado.campanhas?.length) {
+    camps.length = 0;
+    estado.campanhas.forEach(c => camps.push({ badge:c.badge, cls:c.cls, badgeTxt:c.badgeTxt, name:c.name, m1lbl:c.m1lbl, m1val:c.m1val, m2lbl:c.m2lbl, m2val:c.m2val, rodape:c.rodape, dest:c.dest }));
+    renderCamps();
+  }
+
+  // Conquistas
+  if (estado.conquistas?.length) {
+    wins.length = 0;
+    estado.conquistas.forEach(w => wins.push({ emoji:w.emoji, title:w.title, desc:w.desc }));
+    renderWins();
+  }
+
+  // Próximos passos — restaura ANTES dos _idx_ para não ser sobrescrito
+  if (estado.proxPassos?.length) {
+    const lista = document.getElementById('next-list');
+    lista.innerHTML = '';
+    estado.proxPassos.forEach(txt => {
+      const li = document.createElement('li'); li.className = 'next-item';
+      li.innerHTML = '<span class="next-arrow">→</span><input placeholder="Próximo passo..." value="' + txt.replace(/"/g,'&quot;') + '" />';
+      lista.appendChild(li);
+    });
+  }
+
+  // Inputs sem id — por índice, mas IGNORA os que estão dentro de seções já restauradas
+  if (estado.inputs) {
+    const allInputs = [...document.querySelectorAll('input:not([id]), textarea:not([id])')];
+    allInputs.forEach((el, i) => {
+      // Pula inputs dentro de seções dinâmicas já restauradas acima
+      if (el.closest('#tasks-container, #camp-container, #wins-container, #next-list')) return;
+      const val = estado.inputs['_idx_' + i];
+      if (val !== undefined) el.value = val;
+    });
+  }
+
+  calcOrc();
+  calcFollowers();
+
+  const periodInput = document.querySelector('.tag-r .tag-input');
+  if (periodInput?.value) document.getElementById('disp-period').textContent = periodInput.value;
+}
+
+function salvarEstado() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(coletarEstado()));
+    const s = document.getElementById('autosave-status');
+    if (s) { s.textContent = '💾 Salvo automaticamente · ' + new Date().toLocaleTimeString('pt-BR'); }
+  } catch(e) {}
+}
+
+function iniciarAutosave() {
+  let timer;
+  document.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(salvarEstado, 800); });
+  document.addEventListener('change', () => { clearTimeout(timer); timer = setTimeout(salvarEstado, 800); });
+}
+
+function mostrarToast(msg, cor) {
+  const t = document.createElement('div');
+  t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:'+(cor||'#0d1a0d')+';color:'+(cor?'#fff':'#48bb78')+';border:1px solid '+(cor?cor+'88':'#48bb7844')+';border-radius:10px;padding:12px 22px;font-size:13px;font-weight:600;font-family:Inter,sans-serif;z-index:9999;opacity:0;transition:opacity .3s;white-space:nowrap;box-shadow:0 4px 20px rgba(0,0,0,.4);';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  requestAnimationFrame(()=>{ t.style.opacity='1'; setTimeout(()=>{ t.style.opacity='0'; setTimeout(()=>t.remove(),400); },2800); });
+}
+
+function limparDados() {
+  if (!confirm('⚠️ Isso vai apagar todos os dados e resetar para um novo cliente.\n\nTem certeza?')) return;
+  try { localStorage.removeItem(STORAGE_KEY); } catch(e) {}
+  location.reload();
+}
+
+window.addEventListener('load', () => {
+  if (document.body.classList.contains('modo-cliente')) return;
+  try {
+    const salvo = localStorage.getItem(STORAGE_KEY);
+    if (salvo) {
+      aplicarEstado(JSON.parse(salvo));
+      mostrarToast('✅ Dados restaurados automaticamente');
+    }
+  } catch(e) {}
+  iniciarAutosave();
+});
+</script>
+
+
+</body></html>
