@@ -1,365 +1,8 @@
 <!DOCTYPE html>
-<html lang="pt-BR"><head>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <script>
-      (function() {
-        // Capture host references before any artifact code runs: Window.parent
-        // is [Replaceable] (a top-level `var parent` in artifact code would
-        // replace the accessor with a data property), and a top-level
-        // `const crypto` would shadow the global — either would otherwise
-        // silently break the bridge for artifacts that worked before.
-        const realParent = window.parent;
-        const cryptoObj = window.crypto;
-        // crypto.randomUUID exists only in Secure Contexts; fall back to a
-        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
-        // uniqueness is what the bridge needs, unpredictability is
-        // defense-in-depth on top of the source guards.
-        const newRequestId =
-          cryptoObj && typeof cryptoObj.randomUUID === "function"
-            ? function () { return cryptoObj.randomUUID(); }
-            : function () { return Date.now() + "-" + Math.random(); };
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        // Bridge request ids are crypto-random (not sequential) so they
-        // cannot be predicted by other frames in the tab.
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = newRequestId();
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Null-body statuses: Response(stream, {status: 204}) throws
-                // per the Fetch spec, which would escape this resolver and
-                // hang the artifact's await forever.
-                if (response.status === 204 || response.status === 205 || response.status === 304) {
-                  try {
-                    resolve(new Response(null, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: response.headers
-                    }));
-                  } catch (err) {
-                    // Invalid statusText/header bytes can throw here too.
-                    reject(new TypeError(
-                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                    ));
-                  }
-                  return;
-                }
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream. Response()
-                // requires status in [200, 599]; an opaque/no-cors fetch
-                // forwards status 0, which would throw here and escape the
-                // resolver, hanging the artifact's await. Surface it as a
-                // network-error-shaped rejection instead.
-                try {
-                  resolve(new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers
-                  }));
-                } catch (err) {
-                  streamControllers.delete(channelId);
-                  reject(new TypeError(
-                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                  ));
-                }
-              },
-              reject,
-              channelId
-            });
-            
-            realParent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          // Only the embedding parent may drive the bridge — sibling and
-          // nested frames can also postMessage into this window.
-          if (event.source !== realParent) return;
-          if (event.data.type === 'takeScreenshot') {
-            // Echo the request's nonce so the requester can correlate the
-            // reply to ITS request — a reply without the expected nonce
-            // (e.g. from a stale pre-remount artifact) is ignored upstream.
-            const screenshotNonce = event.data.nonce;
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures (htmlToImage undefined) and toPng errors
-            // so the parent always gets a response instead of hanging forever.
-            try {
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              realParent.postMessage({
-                type: 'screenshotData',
-                nonce: screenshotNonce,
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
-    
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              realParent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            realParent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            realParent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          realParent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
-  
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Relatório Mensal — Rabbit Assessoria</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
@@ -580,20 +223,20 @@ body.modo-cliente .client-nm-input { border-bottom-color:transparent !important;
 }
 </style>
 </head>
-<body id="artifacts-component-root-html" class="modo-cliente">
+<body>
 
 <!-- HERO -->
 <div class="hero">
   <div class="logo-row">
-    <img class="logo-img" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA0EAAADeCAMAAADM+/vgAAAACXBIWXMAAC4jAAAuIwF4pT92AAAAM1BMVEVHcEzYjWv4+Pj7+/vRUAn8/Pz9/f3SUQr+/v7+/v7SUgr+/v7+/v7SUgr+/v7////SUgvdj7pkAAAAD3RSTlMAER8zPENldYKfq7vP2eDdXcLQAAAVuklEQVR42uyd4ZaquBKFd0gMBrHp93/K6dEjEgm5c3v1zDrHpSAEKhHq+9/aNvncVRU6gGHSR/CfgGGmIz6PRa7478AwE/n8Jk2NzCEMs9/vdggjO7yExgjkIYD96A+lQ99OYgz7cX+n3WEJdiDj+Pkvx0IhLT6qOSj3EtPZvfgm414zmMOID7WvQvk46AyvYqoe9rhHV0ugQUbx+RvHXCRoUDiDX0nhy2+UQbQfal/NgcnYoIfkn39SqAQNCucgMQ1TvYYcYxDth9rP9XYZG/QA9flNkhJ9kP1Nw38HTWLQPZrSoOpjxwY9GsY94Jivz6DKYAKiepF9FIOqg6Ax6Ic9G9QzSiBwiMCggG4/aLEf4hhUlYLSoMqwQT2NEIFDBAYFrfKA6xvJoOpAalC1Z4N6yjhah+gNqkzAIGGILJJB1YHUoEqzQT3zbFqH6A2q9hhJWb3KLpZB1Z7UoGrHBvWUcbQO0RtUZRjHInLu5v5QpAZ9sEH9Zdw9R7UmgwxGIQOKKTqDDqQGVXs2aKCMu6dQUQ0irEFCLu9HPIOqHalBVcYG3ZdxQ+QikkGxQ8gErCtCgwytQXs2qGdLiLaUozeowhjKgCAgNKiiNejABvWEEHEpR2/QDiMI+GYmNUiTGlRlbNCDWcIg+ToMMgGDhF4OEQ0ytAZpNujBLGGYo1iDQYeAQUIvHxENOtAatGeDem7Qpu2G6A0q0UPQ2hPxDCppDTJsUM8sIZ1KLov+qgpjUIhGBlIyPh3hHovXMIV49+sk8DoSYxB84tJ2aRxeQ5cqtkHJKix5HXEIDSNLtRmDFEax42XEBr1CWXAGPURwLbXhA0l9jZfRR7ENgyQ32JsmP35Wn8djkedKYQhhR200KjaIG6G1o4wEIKU2pix/TMJTvLcYQZlvwKBMsEFbRuM3fkz6/PZIhHZCAEwe2yDbPMXOF0H0BvnmCVgE1zymBRGu6cGjh6YHh4X49qh6eEp2G6QQvUHt9Sntwga5RTPo+hiLRXDXx9xAhLv2gD7s9TkO4bhej8rPIhcBIUShUJZoG+Qdl3FbwKEfbapjrqaHEEyxUYM6zwZtgdZhCGnKY6GmhhB0QWBQgoME37FBvEn6L1L/v55TPc71oPM1GyTBGcT3ur2ENj8WWYzEFKs2iDNo49QAMMYijEYXnEGs0LoIGA1oM0UhziA2iEMoAF2s1CAh8AQHz3fGbQNPo9A6DVJ4RgfeENoK1r2zQlmiRRzAo4St4M8gQOerrOKeRxA8niBYIa7jJmByziBuhFZKY0GAUasxaDhNHMDj7A1RO2qF6A0i15fH2RvCkygkjViJQcMqdGzQtmhrkCi0GYM84D2eILgRYoWmoYutGOT4P715mrAEOt9OFQfHBm2Ki33LmXaWZhHHowQeyC2EUVswqAN4nM0bq8tQig0Y5ACg44NLN0Z7JlJoI1Wcx1MUrzYeyE1Gmo1UcY5+GCfQg+dHBC1OU7/dQC6LLlCPRk8RMX6ljlbYjhVaDK3WbpBDnFGCpM2gHXrwnEIEdRy9QTTx5zEwzhZYgkyThoLmDIqmUL4Gg9TQ6vHUv3YBylDI9uAMiqWQUavOIP/jEfEowUhQhkIhwBkUTaFSvL1BmRhaPJ7UoMxo9OIwJ9lBohfHE7lFMXQG0RdxLkIG6VKjF+8wH2J/VOilxYZpzu8z0lb0WyfD7nriDNqJTEkMcMNMCCUyLYbfbsu0X6XEwhjXRjUoC6hAhiTohl9FOgQgKowgOBS0xgM4g3rwZ6OxMObsY1ZxwYNfiSG63p8mxt9AieuwbfylptwVojdIh1ZxmRiOMJ+QQTeQYvkOn+bs3qEVymLpK18QsEvIoAaUeDYIaOvFFRKxDJIHhO5lyBd+3KVjUNOBkpr9AdCeLBZF6kgG7UsR3AbL4QiCRyoK+SsoaW+szzeXhSs5o2IYtCtz9NOGZZBLb5RQg5Qru/ODO9dYEr3wNFtJ3CGkxCC3sEFC90oGZSvOhMaxOj94NE5rLIZ2DcJQSxjaBg4SUssgdwElLUfQ77StNRJLYdDEmWaHF3GBGaRAhv/lQUj7i635k3bJUs7k6Rl0A0EGIaPbHvcgxLFAuMc3X5ZMofgGORtoEJBSCPlzxwJFx1/OFgthjrlKyqAawwjx0l11LoEM6kCK86zLQ9rLV41lkKacLlEWZ5Ck+tdsSqMEWe5AiP7gE3ye13K1S06iLM7eo+gv3ZLaUhXFHoSIo2ZZnjp0OjssJ9FnkYvoBtXBd8W5uzSK/wyU3IASwwo9pz2dLRZDm7JQcQ1qbsHnPHWvZRAkyNDECu3ZlL6GaMnhttRloSIa1FyBGau4jsCgFBXKOYX6aPsaonB0ecxFgEEUAkn00CVoELQGJWbHngw0RF+1xVJIUxUihkH1FTMY5AmquOTXdMETuUGJLl8LtkS6yukNqu3s51O7/j0lSoygVYgdGcS3l7/O1i220aqoDfLzn0/t0YMCJWIPSiS3Qi/RXk7nehmLZJkTG1TsZsqgFBshQEtQsuc67kXa5nL6WkQjc1SkBqHQM0bQcAYJ0LIHJYJDaAR+GY1kWQhKg2B0uEEOiWYQVAZK2KCpGs3pkS4VpUEw++Dmq3s5g6QALZpD6C00ai6nv85z5ZEsC0qDkMvQ+0r964efqlUbBN4TCqBtfzxyCEUfBaFBMBhGhmVQeCPkv+651E2LIYTEJOzXHX9fXvmCVPzI8hk8Ov0VLJEsFaFBch8i0L00nmpP9Wavv06OKhX8zdbni+cQIqE51+FzbTqDkGdhBnWINUrozrUHXdl4OzXoR/LqnwXf1AjE5HQGoQiboJfV70jSFWZ/ecIl7a81Py2fhsYiEFMIsoskd7N+tZIq5GjXtG3Qh+KlPxeXOcbaVAZBva9BuFnSN7w6DiEaLLDMPCGjH/pmImGDYEF6G4TlRogGh3BKNdog29xhXbhCEikb5HxAKPCj6lZtEB6N5NTo86Kl3Av0I9/YIDgFQjov8BzeEEoMgyb8S9XZsw16sJFE0gp1vE6Yp5gi3CCgqy/oZzfbqucdk80h1D1CpLNSdCHmGJjeLgVGEDJI4B2TN0BICSnhAOfaya+B7xeRT/sY5+Ccj2wQtDz7cINwa/KpC1tiHLxjkjhCS/37pbXOeoxBffs3aMDPyzvnJnikNOZClmc/wxK0+dShrwRn0IpQRuJPNIyt/ev2aIzi2zUHi1Fpp4FZFQo3qLM6hQwSkh/3FhOlNR6gdW19gD2DSJi7OKI8gE+aS7hBcElkENigiAij8QRj6mbAHikRxk/pZzHkkTAas6JxCTAo8Cg3IcBl3GoKuGmPVxRaS8yGxo9HcHB+5LuFK6RAjALA42x66M/jN7L2Q5Xf3B4B7lskAJBOLnfEknZNLIMkG7QOCv3K3DcgEAIqOwKMayMZJDArIuN7CCIJNHruCyG1xlowZ7+KDIJkg+IJNKzQiSB+COj5bBloERJcxqXNnNNhWQDfCFVURmJNyDyKQQps0PujzLjbyFRelhprw6gYVZxgg1bACBu0dJASq8ScImSQxMwIAax2h8knX8MNI7WWWCdSrcEgKNKUTPULgE/0joFJ3yD6V8wkeuj4ZF9AceX8g8zJDZLJv2Se0tnYjiMobfQaDBKYE6lJl7RWmCPy+JkSkZBiDRkkMB/ZAZQG7QxH0HujkzLIfT3hQjVK2JWCcknrgmIUx/sHCyLTMghPcCRlXKbLQtAt6Wz/YQDOoPdGQ6UjENy0Q9XkHA28kFJikNtEWXa4Q4oRbxcOH02xGOItDIJT8xokCtITRpXCFDz//236eAVKspgGheM7UHLjNih9RAZK1DSB4NK4phaktGxQ+vjsDQYJQLdFg/yN12fyOKh3KOLgvEjAoLYDJZbXJxt0hxoyKO1GyIINYv7EEmfQWxvkbqCk6ZAkPCAMzSD6Nmi4EXIgoAYl/srLM31q/y4GufgGWQdKrgBnUPJYIAMdmVjEIJoP4RtQ0nIX9BYRRGuQxHRJXOwbTeoOhPgaqdJyCP2Ls1iBQUQZ1NzQQ2RfeUYYK4JSMsihFxf3zor2CkrqGwBuhBKnbrECg2jKuPYXKGksxsEtWgRsgwCDKAcJ8UcJ7gJK7BUAuIxLG1vjmyydNihAIblwAnkQ0tQAOIQSx9WeDXoRSytQfUXq1CyQO3ukZZADCEYJ6UeCv1hMgmft1AK9m0EeUULIna4gxJ5ueAOsw6axZw96g4QIMqiNYZBvzh1pANUeAIdQ6gF08YhgkEJYBjl6g9ozB9Bj2nrLAdQCiJFBYQbBUxvk6l8d6HChAcRbViTUF49gg+jbIPpRgr2cLWn+nG94J2q30QquASIZtAs2iC6EfHOqb5Rtxd91h//gVihZ6lOLO1Qyg4TAUcINc+FvzoIO59ob3hBXG2wMa1sgmkEZAg3yXix/9G/rnOtAhXfO3fCm+EZL9gdQt2zaP1d37UiD2kCDYCV6CPz9HND5zmEEwW8X4Kpv53tmyi3DNM4V+8MwARw/t0LBp4UzC1BsxR/B15rhDJrIMWd/mGXIN6APl2/MYijWh2G4hntCkbM+DI8RpkVPrtgehmu4iYUbzw0YCsRxhfpw4cZwDce7PgwPsqNQ8FVluAligRgeZMeBSziGm6AAcr6qDNdwHEEMD7K5C2IokZJrOC7imKlkVVUdBA+yw+Gt1G1yqP7BcBPEbRAzjeobHmSHw2tpwwZ9cA3HBjHT0NU/7LiGY4OYiejDYceDbO6DGL4ZgQ1iWCCeZjPM/9o71/W2QRgMI86HYe7/btcmJLU/YzGatMuBd39WmzKmR58lQNi/v4qQY3ROa02aPhGfEGmt3Qcx5qmgySyHa5FPwiHRhbT+VNKsSZj8AFKK34LuKh5NYhAi5/Ksi/sp1Cecp6kPGG8jvN/ugm4eAwkWpsl1ePJroL4UzwzlnlD+JfHwaPcj0SiLd8aEciEYEjukTaWSvBE76KuDxdcOALLp0kC1x+CXUglWNsbgv8ZQ7zN9BNOs4LHXgaivLdXQMce9yI/zDjbSLs7FuLthyhZLYG5fNizonRY7EAA0SVIgaikbPIF+UinYBWKW41FWsSQhayO7utg1x12ID/YeKdIxz4nQPaj6SCmkk3dhsTJV5w0ppHLGQwer+9ABdlH/YnYixjEUuRFQVUWqPTS6oBo4/lybJNorSILKIQYx5rgV9wjBB9Euz4nQXQTk5TUPOvnMzvttbSDNspEQdkAm1Q6gi2uTcwOzF1C6XFMeJSTPQYXqT7YhIUq1j/V/g3YKWi5KpNXFvjluRz/qxw/IxTwnQjdg8HkvIQ+z6Iq+TiMqCjswu0QubZtY9H/CCxL8Np1Ei3Kh3b+hIC1MBApaKRFiEG+O/yqg7ASJn4R0nmnct1kwYRJqW62881URNv4cquduNbfAz0Uybmp3Tio3LeQ+qi2gOd9OPv1eQbYxOeqb40YoP/i333Scadz3kNXN8HEuocGxTzUcrLo/qAH9fStJCWNYK8SCXOolLzAQbpAY2Qo0ghjEmuNWAT3+t6vI5VmWMEr1RMVdU40kBhUUWJ/ztQeMfGqjIBwDKkjtVexRcIABcUMEwhjEm+Mm4mOGH0TnmcZ9S0HUUxAqxCQvN36JgS0Es53kUMO5A/eUJ58sZHlbbPIkLkjQCugKhM/EIMYcNxAfVj+IjnNLaBDyyXBxCQXAuCmzVOEFsqx79dAEMb31MA9jQJ2iWDAG9c3x6wJyJP4LOs6Z0DhsipU6OyIeZhdIqLcZnzeFVyEVkBirR8jbQCx8DOqbY5z48PpBDc2Z0CCtCgQFezWKXYtA/0cv7kWmVPf+WZUGyQ0hHf2e6segAXOME5/v09c6ziD0Xcj4ckLhJv0fQ2xR0GLlYfxIvcuynPDQBdY0BHM8Ans0y7NDMYg3xzgUx/Uj/j8U52LCKFIZW3fs0WX8taBTsXV1yTdUpk4RbAfsssjlWpcqGQlB0Smz2g0rdnwMGjDHKPFZ9IPoOPO4f8f4VL7wHl1GpdIpmy4XkpfoxMesJWLLqrpbsGWjwRAz18f0LgzEIMYcv7IPlLUAnk5DmcT7gO5fvbO5/bJqlAzfyWJpSEEVslUjR/mcSathKlZBIJqBGMSYYxydn00/qKE5Fepjv6KHVfLYIWn1ZF6U2KO+7he7VdCfFJp/mGNIxVNDpyYspRLkvyhoKAbx5hhHP/8UQucpoSY4x/GG8JHOTqyL6Zxw8wJqGvqgihId3A/ljLxzDOLNMY57iY/46jxXEzgUPM7RZQ5zKdNJCj1Wmg2JqLBnCqjOiWR3wGogBo2bgyc+awKHuCkhBqhfZlwGj5OSAOA4qUK/Hd+Tsp3cM8GiNb/MzcegcXPwUHyWDdQ+FKeEAKhZG3UZgiDE6zIxcuMlsvSCp8RFa36Zm49BvDl+MveJWjw4Os81bQBcj3MZqfiCAqmotYi8MDVr8LocQUry55bwPnYLcsOS1X4M6ptjCPf0CRzi8oxCRwqyvMvYUhJXRaMuToruD41X4K8RagwLchI4NiZoWHuHSu7HoL45BqD8AvpByE0JjSlo/Rhvuh02xmpSqMxkKrphFNAvuD4MHYIiU9TDxKD7KsgNVSA8DxTnojajIJzmKIgFrSUujAVYTYpnE3AlgCBKtROwqkFWHdSsD5dwdTAGoTnu72eOBM9T77BGepfv8DZL0BQep8YMy0IXzLmchI6Jr++4yAlbrEOaYd/vYCG+4Psc+Bg0YI4eOo9UYD8dOs8Cn4NkCl99qJjHu6kez+pDwc8GYhierQ57v7Xr9gs13rTAqVRY/C0+BvXN0Yfiy+VviMtzMrQTg4X6t+01C2d3ZNjeV1DHRragIMxmo5I8lhwQHkEyZev9Cd5BqlL/pVQWPJ+JQQPmYHHPv37QhwYXGl8dX6uhlVLG1pqc0zWraN2kBHtuk85NUB8lne4rG1olOaZ2cdRAXkvRPrgMQ2IqtZzvGw9lEa2DgDJBEy4GDZnj9gwnavHUUJxhaCMhRMlyhq5Pc8SC8yKeOq/Ftvs6BiBJeKXvCqxuRSEbixrjY9CAORi3emH9IOTyDENXVADnv7qRxIp/PHqABxMqXokdZEv/7AKeoMBh4gkKXoWLbIkFWUBWnDkYXH655QOeqaEVZOzptEGwl1xF2ZCSFSuUtemzkbdKtJC1D3+c7igLHey78OdhHJxTVef7Ce6jClGDfAySIchhcyA6v0H4QXScGnoJUIVnHcv2h+/Vr7oSH37eKpmL8yORk1v0kyH8vGEgym5+L3/yPQ/KTotXhUaSuTiTuQnq503lg2bIU0STcVwe+PDci6NdntncZATt+sGHxPtAQrs4A9HkH+k4S474oJ2haEOeS3NvjZupG6uiOLeIJt9aPsjZuekYgoQg15fRnA/NALTN2/T0iC1auxjzDEOTNRRzJeb4iXNan7UzBdSGtHYfxBgzcJHQXzBR99fKVBHEAAAAAElFTkSuQmCC" alt="Rabbit Assessoria">
-    <div class="period-pill"><span id="disp-period">junho de 2026</span></div>
+    <img class="logo-img" src="data:image/png;base64,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" alt="Rabbit Assessoria" />
+    <div class="period-pill"><span id="disp-period">Mês / Ano</span></div>
   </div>
   <div class="client-block">
     <div class="client-lbl">Relatório para</div>
-    <input class="client-nm-input" placeholder="Nome do cliente" value="Labelessence">
+    <input class="client-nm-input" placeholder="Nome do cliente" />
     <div class="tags-row">
-      <span class="tag-r">📅 <input class="tag-input" placeholder="Ex: Junho 2026" oninput="document.getElementById('disp-period').textContent=this.value||'Mês / Ano'" style="color:#e53e3e;" value="junho de 2026"></span>
-      <span class="tag-g">✅ <input class="tag-input" placeholder="1º mês de parceria" style="color:#48bb78;" value=""></span>
+      <span class="tag-r">📅 <input class="tag-input" placeholder="Ex: Junho 2026" oninput="document.getElementById('disp-period').textContent=this.value||'Mês / Ano'" style="color:#e53e3e;" /></span>
+      <span class="tag-g">✅ <input class="tag-input" placeholder="1º mês de parceria" style="color:#48bb78;" /></span>
     </div>
   </div>
 </div>
@@ -601,13 +244,192 @@ body.modo-cliente .client-nm-input { border-bottom-color:transparent !important;
 <!-- NÚMEROS DO MÊS -->
 <div class="sec">
   <div class="sec-t">os números do mês</div>
-  <div class="kpi-row">
-    <div class="kpi red"><span class="kpi-emoji">💰</span><div class="kpi-lbl">Valor investido em anúncios</div><div class="kpi-val">R$ <input placeholder="0,00" value="680,51"></div><div class="kpi-note"><input placeholder="quanto foi gasto nos anúncios" value=""></div></div>
-    <div class="kpi green"><span class="kpi-emoji">📩</span><div class="kpi-lbl">Pessoas que entraram em contato</div><div class="kpi-val"><input placeholder="0" value="158"></div><div class="kpi-note"><input placeholder="contatos recebidos no mês" value=""></div></div>
-    <div class="kpi blue"><span class="kpi-emoji">👀</span><div class="kpi-lbl">Pessoas que viram seus anúncios</div><div class="kpi-val"><input placeholder="0" value="51.821"></div><div class="kpi-note"><input placeholder="alcance total do mês" value=""></div></div>
-    <div class="kpi yellow"><span class="kpi-emoji">💸</span><div class="kpi-lbl">Custo por contato</div><div class="kpi-val">R$ <input placeholder="0,00" value="3,31"></div><div class="kpi-note"><input placeholder="quanto custou cada contato" value=""></div></div>
+
+  <!-- META ADS -->
+  <div style="margin-bottom:14px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <div style="width:28px;height:28px;background:#1877f218;border:1px solid #1877f244;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:800;color:#1877f2;">f</div>
+      <span style="font-size:11px;font-weight:700;color:#1877f2;letter-spacing:1.5px;text-transform:uppercase;">Meta Ads</span>
+      <div style="flex:1;height:1px;background:#1877f218;"></div>
+    </div>
+    <div class="kpi-row">
+      <div class="kpi" style="border-top:2px solid #1877f2;">
+        <span class="kpi-emoji">💰</span>
+        <div class="kpi-lbl">Valor investido</div>
+        <div class="kpi-val">R$ <input id="meta-invest" placeholder="0,00" oninput="calcTotais()" /></div>
+        <div class="kpi-note"><input placeholder="gasto no Meta" /></div>
+      </div>
+      <div class="kpi" style="border-top:2px solid #1877f2;">
+        <span class="kpi-emoji">📩</span>
+        <div class="kpi-lbl">Pessoas que entraram em contato</div>
+        <div class="kpi-val"><input id="meta-contatos" placeholder="0" oninput="calcTotais()" /></div>
+        <div class="kpi-note"><input placeholder="contatos via Meta" /></div>
+      </div>
+      <div class="kpi" style="border-top:2px solid #1877f2;">
+        <span class="kpi-emoji">👀</span>
+        <div class="kpi-lbl">Pessoas que viram seus anúncios</div>
+        <div class="kpi-val"><input id="meta-alcance" placeholder="0" oninput="calcTotais()" /></div>
+        <div class="kpi-note"><input placeholder="alcance no Meta" /></div>
+      </div>
+      <div class="kpi" style="border-top:2px solid #1877f2;">
+        <span class="kpi-emoji">💸</span>
+        <div class="kpi-lbl">Custo por contato</div>
+        <div class="kpi-val">R$ <input id="meta-cpl" placeholder="0,00" /></div>
+        <div class="kpi-note"><input placeholder="custo/contato Meta" /></div>
+      </div>
+    </div>
   </div>
-  
+
+  <!-- GOOGLE ADS -->
+  <div style="margin-bottom:14px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <div style="width:28px;height:28px;background:#ea433518;border:1px solid #ea433544;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#ea4335;">G</div>
+      <span style="font-size:11px;font-weight:700;color:#ea4335;letter-spacing:1.5px;text-transform:uppercase;">Google Ads</span>
+      <div style="flex:1;height:1px;background:#ea433518;"></div>
+    </div>
+    <div class="kpi-row">
+      <div class="kpi" style="border-top:2px solid #ea4335;">
+        <span class="kpi-emoji">💰</span>
+        <div class="kpi-lbl">Valor investido</div>
+        <div class="kpi-val">R$ <input id="google-invest" placeholder="0,00" oninput="calcTotais()" /></div>
+        <div class="kpi-note"><input placeholder="gasto no Google" /></div>
+      </div>
+      <div class="kpi" style="border-top:2px solid #ea4335;">
+        <span class="kpi-emoji">📩</span>
+        <div class="kpi-lbl">Pessoas que entraram em contato</div>
+        <div class="kpi-val"><input id="google-contatos" placeholder="0" oninput="calcTotais()" /></div>
+        <div class="kpi-note"><input placeholder="contatos via Google" /></div>
+      </div>
+      <div class="kpi" style="border-top:2px solid #ea4335;">
+        <span class="kpi-emoji">👀</span>
+        <div class="kpi-lbl">Pessoas que viram seus anúncios</div>
+        <div class="kpi-val"><input id="google-alcance" placeholder="0" oninput="calcTotais()" /></div>
+        <div class="kpi-note"><input placeholder="alcance no Google" /></div>
+      </div>
+      <div class="kpi" style="border-top:2px solid #ea4335;">
+        <span class="kpi-emoji">💸</span>
+        <div class="kpi-lbl">Custo por contato</div>
+        <div class="kpi-val">R$ <input id="google-cpl" placeholder="0,00" /></div>
+        <div class="kpi-note"><input placeholder="custo/contato Google" /></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOTAIS -->
+  <div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <div style="width:28px;height:28px;background:#ecc94b18;border:1px solid #ecc94b44;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:14px;">⚡</div>
+      <span style="font-size:11px;font-weight:700;color:#ecc94b;letter-spacing:1.5px;text-transform:uppercase;">Total Geral</span>
+      <div style="flex:1;height:1px;background:#ecc94b18;"></div>
+      <span style="font-size:10px;color:#444;">calculado automaticamente</span>
+    </div>
+    <div class="kpi-row">
+      <div class="kpi yellow" style="background:#12120a;">
+        <span class="kpi-emoji">💰</span>
+        <div class="kpi-lbl">Total investido em anúncios</div>
+        <div class="kpi-val" id="tot-invest" style="color:#ecc94b;">R$ —</div>
+        <div class="kpi-note" style="color:#555;">Meta + Google</div>
+      </div>
+      <div class="kpi yellow" style="background:#12120a;">
+        <span class="kpi-emoji">📩</span>
+        <div class="kpi-lbl">Total de contatos recebidos</div>
+        <div class="kpi-val" id="tot-contatos" style="color:#ecc94b;">—</div>
+        <div class="kpi-note" style="color:#555;">Meta + Google</div>
+      </div>
+      <div class="kpi yellow" style="background:#12120a;">
+        <span class="kpi-emoji">👀</span>
+        <div class="kpi-lbl">Total de pessoas alcançadas</div>
+        <div class="kpi-val" id="tot-alcance" style="color:#ecc94b;">—</div>
+        <div class="kpi-note" style="color:#555;">Meta + Google</div>
+      </div>
+      <div class="kpi yellow" style="background:#12120a;">
+        <span class="kpi-emoji">💸</span>
+        <div class="kpi-lbl">Custo médio por contato</div>
+        <div class="kpi-val" id="tot-cpl" style="color:#ecc94b;">R$ —</div>
+        <div class="kpi-note" style="color:#555;">média geral</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="hint">✏️ Preencha os campos do Meta e Google — os totais calculam automaticamente</div>
+</div>
+
+<!-- RESULTADO EM VENDAS -->
+<div class="sec" style="padding-top:0;" id="sec-vendas">
+  <div class="sec-t">resultado em vendas</div>
+  <div style="background:linear-gradient(135deg,#0d1a0d,#0a1a12);border:1.5px solid #48bb7833;border-radius:16px;overflow:hidden;">
+
+    <!-- Header destaque -->
+    <div style="background:linear-gradient(90deg,#1a2e1a,#0d1f15);padding:18px 26px;border-bottom:1px solid #48bb7822;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div style="width:44px;height:44px;background:#48bb7822;border:1.5px solid #48bb7855;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;">🏆</div>
+        <div>
+          <div style="font-size:15px;font-weight:700;color:#e8e8f0;">Retorno gerado pelos anúncios</div>
+          <div style="font-size:12px;color:#555;margin-top:2px;">quanto os anúncios trouxeram de resultado real</div>
+        </div>
+      </div>
+      <div id="roas-badge" style="background:#48bb7818;border:1px solid #48bb7844;border-radius:20px;padding:6px 16px;font-size:13px;font-weight:700;color:#48bb78;display:none;">
+        ROAS: <span id="roas-val">—</span>x
+      </div>
+    </div>
+
+    <!-- Inputs: faturamento e vendas -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#48bb7815;">
+      <div style="background:#0d1a0d;padding:22px 26px;">
+        <div style="font-size:11px;color:#48bb7888;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;">💵 Faturamento bruto</div>
+        <div style="display:flex;align-items:baseline;gap:4px;">
+          <span style="font-size:16px;color:#48bb7866;font-weight:600;">R$</span>
+          <input id="inp-faturamento" placeholder="0,00" oninput="calcVendas()"
+            style="background:none;border:none;border-bottom:2px dashed #48bb7844;color:#48bb78;font-size:32px;font-weight:800;font-family:inherit;outline:none;width:100%;padding:2px 0;" />
+        </div>
+        <div style="font-size:12px;color:#444;margin-top:6px;">total que entrou no caixa com os anúncios</div>
+      </div>
+      <div style="background:#0d1a0d;padding:22px 26px;">
+        <div style="font-size:11px;color:#48bb7888;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;">🛒 Número de vendas / agendamentos</div>
+        <div style="display:flex;align-items:baseline;gap:4px;">
+          <input id="inp-vendas" placeholder="0" oninput="calcVendas()"
+            style="background:none;border:none;border-bottom:2px dashed #48bb7844;color:#e8e8f0;font-size:32px;font-weight:800;font-family:inherit;outline:none;width:100%;padding:2px 0;" />
+        </div>
+        <div style="font-size:12px;color:#444;margin-top:6px;">clientes que compraram ou agendaram</div>
+      </div>
+    </div>
+
+    <!-- Resultados calculados -->
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:#48bb7815;">
+      <div style="background:#0a1a0a;padding:18px 22px;">
+        <div style="font-size:12px;color:#555;margin-bottom:8px;">📈 Para cada R$1 investido</div>
+        <div id="res-roas" style="font-size:28px;font-weight:800;color:#48bb78;">—</div>
+        <div style="font-size:12px;color:#444;margin-top:5px;" id="res-roas-sub">voltou em vendas</div>
+      </div>
+      <div style="background:#0a1a0a;padding:18px 22px;">
+        <div style="font-size:12px;color:#555;margin-bottom:8px;">🎯 Ticket médio por venda</div>
+        <div id="res-ticket" style="font-size:28px;font-weight:800;color:#e8e8f0;">—</div>
+        <div style="font-size:12px;color:#444;margin-top:5px;">valor médio por cliente</div>
+      </div>
+      <div style="background:#0a1a0a;padding:18px 22px;">
+        <div style="font-size:12px;color:#555;margin-bottom:8px;">💹 Lucro sobre investimento</div>
+        <div id="res-lucro" style="font-size:28px;font-weight:800;color:#e8e8f0;">—</div>
+        <div id="res-lucro-sub" style="font-size:12px;color:#444;margin-top:5px;">faturamento − investimento</div>
+      </div>
+    </div>
+
+    <!-- Barra de retorno visual -->
+    <div style="padding:16px 26px 20px;border-top:1px solid #48bb7815;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <span style="font-size:12px;color:#555;">Proporção: investimento × retorno</span>
+        <span id="retorno-pct" style="font-size:13px;font-weight:700;color:#48bb78;"></span>
+      </div>
+      <div style="background:#1a2a1a;border-radius:99px;height:12px;overflow:hidden;">
+        <div id="retorno-bar" style="height:100%;border-radius:99px;background:linear-gradient(90deg,#e53e3e,#48bb78);width:0%;transition:width .5s ease;"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-top:6px;">
+        <span style="font-size:11px;color:#444;" id="bar-inv-label">Investido: R$ —</span>
+        <span style="font-size:11px;color:#48bb78;" id="bar-fat-label">Faturado: R$ —</span>
+      </div>
+    </div>
+
+  </div>
+  <div class="hint">✏️ Preencha faturamento e número de vendas para calcular automaticamente · Deixe em branco se não tiver esse dado</div>
 </div>
 
 <!-- ORÇAMENTO -->
@@ -615,26 +437,26 @@ body.modo-cliente .client-nm-input { border-bottom-color:transparent !important;
   <div class="sec-t">controle de orçamento</div>
   <div class="orc-card">
     <div class="orc-header">
-      <div class="orc-header-left"><span class="orc-icon">📊</span><div><div class="orc-title">Orçamento mensal</div><div class="orc-period"><input placeholder="Ex: Junho 2026" value=""></div></div></div>
-      <div class="orc-status" id="orc-status" style="background: rgba(236, 201, 75, 0.07); border-color: rgba(236, 201, 75, 0.19); color: rgb(236, 201, 75);"><span class="status-dot"></span><span id="status-txt">Quase no limite</span></div>
+      <div class="orc-header-left"><span class="orc-icon">📊</span><div><div class="orc-title">Orçamento mensal</div><div class="orc-period"><input placeholder="Ex: Junho 2026" /></div></div></div>
+      <div class="orc-status" id="orc-status"><span class="status-dot"></span><span id="status-txt">Dentro do orçamento</span></div>
     </div>
     <div class="orc-inputs">
-      <div class="orc-input-cell"><div class="orc-input-lbl">🎯 Meta de orçamento</div><div class="orc-input-val"><span class="orc-input-prefix">R$</span><input class="orc-input-field meta" id="inp-meta" placeholder="800,00" oninput="calcOrc()" value="800"></div><div class="orc-input-hint">valor combinado com o cliente por mês</div></div>
-      <div class="orc-input-cell"><div class="orc-input-lbl">💸 Valor gasto este mês</div><div class="orc-input-val"><span class="orc-input-prefix">R$</span><input class="orc-input-field" id="inp-gasto" placeholder="0,00" oninput="calcOrc()" value="680,51"></div><div class="orc-input-hint">total investido nas campanhas</div></div>
+      <div class="orc-input-cell"><div class="orc-input-lbl">🎯 Meta de orçamento</div><div class="orc-input-val"><span class="orc-input-prefix">R$</span><input class="orc-input-field meta" id="inp-meta" placeholder="800,00" oninput="calcOrc()" /></div><div class="orc-input-hint">valor combinado com o cliente por mês</div></div>
+      <div class="orc-input-cell"><div class="orc-input-lbl">💸 Valor gasto este mês</div><div class="orc-input-val"><span class="orc-input-prefix">R$</span><input class="orc-input-field" id="inp-gasto" placeholder="0,00" oninput="calcOrc()" /></div><div class="orc-input-hint">total investido nas campanhas</div></div>
     </div>
     <div class="orc-progress-area">
-      <div class="orc-progress-header"><span class="orc-progress-lbl">Utilização do orçamento</span><span class="orc-progress-pct" id="pct-txt">85.1%</span></div>
-      <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-fill" style="width: 85.1%; background: rgb(236, 201, 75);"></div></div>
-      <div class="progress-ticks"><span class="progress-tick">R$ 0</span><span class="progress-tick" id="tick-mid">R$ 400,00</span><span class="progress-tick" id="tick-end">R$ 800,00</span></div>
+      <div class="orc-progress-header"><span class="orc-progress-lbl">Utilização do orçamento</span><span class="orc-progress-pct" id="pct-txt">0%</span></div>
+      <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-fill" style="width:0%;background:#48bb78;"></div></div>
+      <div class="progress-ticks"><span class="progress-tick">R$ 0</span><span class="progress-tick" id="tick-mid">R$ —</span><span class="progress-tick" id="tick-end">R$ —</span></div>
     </div>
     <div class="orc-results">
-      <div class="orc-result-cell"><div class="orc-result-lbl">✅ Gasto</div><div class="orc-result-val" id="res-gasto">R$ 680,51</div><div class="orc-result-sub">investido este mês</div></div>
-      <div class="orc-result-cell"><div class="orc-result-lbl">💚 Saldo restante</div><div class="orc-result-val green" id="res-saldo">R$ 119,49</div><div class="orc-result-sub" id="res-saldo-sub">não utilizado este mês</div></div>
-      <div class="orc-result-cell"><div class="orc-result-lbl">📅 Meta do mês</div><div class="orc-result-val blue" id="res-meta">R$ 800,00</div><div class="orc-result-sub">orçamento combinado</div></div>
+      <div class="orc-result-cell"><div class="orc-result-lbl">✅ Gasto</div><div class="orc-result-val" id="res-gasto">R$ —</div><div class="orc-result-sub">investido este mês</div></div>
+      <div class="orc-result-cell"><div class="orc-result-lbl">💚 Saldo restante</div><div class="orc-result-val green" id="res-saldo">R$ —</div><div class="orc-result-sub" id="res-saldo-sub">não utilizado este mês</div></div>
+      <div class="orc-result-cell"><div class="orc-result-lbl">📅 Meta do mês</div><div class="orc-result-val blue" id="res-meta">R$ —</div><div class="orc-result-sub">orçamento combinado</div></div>
     </div>
     <div class="orc-acum">
       <div><div class="orc-acum-lbl">🚀 Crédito acumulado para o próximo mês</div><div class="orc-acum-desc" id="acum-desc">O saldo não utilizado é somado à meta do próximo mês</div></div>
-      <div style="text-align:right;"><div class="orc-acum-num" id="acum-val" style="color: rgb(99, 179, 237);">R$ 919,49</div><div class="orc-acum-sub" id="acum-sub">meta (R$ 800,00) + saldo (R$ 119,49)</div></div>
+      <div style="text-align:right;"><div class="orc-acum-num" id="acum-val">R$ —</div><div class="orc-acum-sub" id="acum-sub">disponível no próximo mês</div></div>
     </div>
   </div>
 </div>
@@ -642,41 +464,23 @@ body.modo-cliente .client-nm-input { border-bottom-color:transparent !important;
 <!-- CAMPANHAS -->
 <div class="sec" style="padding-top:0;">
   <div class="sec-t">campanhas em destaque</div>
-  <div class="camp-grid" id="camp-container"><div class="camp-card top"><span class="camp-badge ouro"><input value="🏆 Melhor resultado"></span>
-    <div class="camp-name"><input value="Combo Dias dos Namorados" placeholder="Nome da campanha"></div>
-    <div class="camp-metrics">
-      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Contatos"></div><div class="camp-metric-val destaque"><input value="70" placeholder="0"></div></div>
-      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Custo por contato"></div><div class="camp-metric-val destaque"><input value="R$ 1,89" placeholder="0"></div></div>
-    </div>
-    <div class="camp-footer"><input value="Campanha com melhor custo por contato do mês" placeholder="Observação sobre esta campanha"></div></div><div class="camp-card green"><span class="camp-badge verde"><input value="👥 Maior alcance"></span>
-    <div class="camp-name"><input value="Pren Lábios — Visita ao Perfil" placeholder="Nome da campanha"></div>
-    <div class="camp-metrics">
-      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Pessoas alcançadas"></div><div class="camp-metric-val"><input value="24.411" placeholder="0"></div></div>
-      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Custo por visita"></div><div class="camp-metric-val"><input value="R$ 0,34" placeholder="0"></div></div>
-    </div>
-    <div class="camp-footer"><input value="Campanha que mais levou pessoas ao perfil" placeholder="Observação sobre esta campanha"></div></div><div class="camp-card blue"><span class="camp-badge azul"><input value="📣 Campanha ativa"></span>
-    <div class="camp-name"><input value="Whats — Vídeo Botox" placeholder="Nome da campanha"></div>
-    <div class="camp-metrics">
-      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Contatos"></div><div class="camp-metric-val"><input value="2" placeholder="0"></div></div>
-      <div class="camp-metric"><div class="camp-metric-lbl"><input value="Custo por contato"></div><div class="camp-metric-val"><input value="R$ 2,27" placeholder="0"></div></div>
-    </div>
-    <div class="camp-footer"><input value="Campanha ainda em andamento este mês" placeholder="Observação sobre esta campanha"></div></div></div>
-  
+  <div class="camp-grid" id="camp-container"></div>
+  <button class="add-btn" onclick="addCamp()">＋ Adicionar campanha</button>
 </div>
 
 <!-- INSTAGRAM -->
 <div class="sec" style="padding-top:0;">
   <div class="sec-t">instagram — seguidores</div>
   <div class="ig-block">
-    <div class="ig-header"><div class="ig-logo">📸</div><div><div class="ig-title">Instagram</div><div class="ig-handle">@<input placeholder="perfil do cliente" value="https://www.instagram.com/labelessence/"></div></div></div>
+    <div class="ig-header"><div class="ig-logo">📸</div><div><div class="ig-title">Instagram</div><div class="ig-handle">@<input placeholder="perfil do cliente" /></div></div></div>
     <div class="ig-body">
       <div class="ig-stats">
-        <div class="ig-stat main"><div class="ig-stat-emoji">👥</div><div class="ig-stat-lbl">Seguidores que você tinha antes</div><div class="ig-stat-val"><input placeholder="0" id="ig-antes" oninput="calcFollowers()" value="11.569"></div><div class="ig-stat-sub"><input placeholder="início do mês" value=""></div></div>
-        <div class="ig-stat main"><div class="ig-stat-emoji">📈</div><div class="ig-stat-lbl">Total de seguidores hoje</div><div class="ig-stat-val"><input placeholder="0" id="ig-total" oninput="calcFollowers()" value="11.664"></div><div class="ig-stat-sub"><input placeholder="seguidores agora" value=""></div></div>
-        <div class="ig-stat-full"><div class="ig-stat-emoji" style="font-size:28px;margin-bottom:8px;">🚀</div><div class="ig-stat-lbl" style="font-size:14px;color:#777;margin-bottom:8px;">Novos seguidores conquistados no mês</div><div class="ig-novos-num" id="ig-novos">+95</div><div class="ig-novos-msg" id="ig-novos-msg">novos seguidores conquistados esse mês 🎉</div></div>
+        <div class="ig-stat main"><div class="ig-stat-emoji">👥</div><div class="ig-stat-lbl">Seguidores que você tinha antes</div><div class="ig-stat-val"><input placeholder="0" id="ig-antes" oninput="calcFollowers()" /></div><div class="ig-stat-sub"><input placeholder="início do mês" /></div></div>
+        <div class="ig-stat main"><div class="ig-stat-emoji">📈</div><div class="ig-stat-lbl">Total de seguidores hoje</div><div class="ig-stat-val"><input placeholder="0" id="ig-total" oninput="calcFollowers()" /></div><div class="ig-stat-sub"><input placeholder="seguidores agora" /></div></div>
+        <div class="ig-stat-full"><div class="ig-stat-emoji" style="font-size:28px;margin-bottom:8px;">🚀</div><div class="ig-stat-lbl" style="font-size:14px;color:#777;margin-bottom:8px;">Novos seguidores conquistados no mês</div><div class="ig-novos-num" id="ig-novos">—</div><div class="ig-novos-msg" id="ig-novos-msg">Preencha os campos acima para calcular automaticamente</div></div>
       </div>
       <div class="ig-chart-lbl">Crescimento ao longo do mês</div>
-      <div style="position:relative;width:100%;height:160px;"><canvas id="cFollowers" width="423" height="160" style="display: block; box-sizing: border-box; height: 160px; width: 423px;"></canvas></div>
+      <div style="position:relative;width:100%;height:160px;"><canvas id="cFollowers"></canvas></div>
     </div>
   </div>
 </div>
@@ -687,23 +491,23 @@ body.modo-cliente .client-nm-input { border-bottom-color:transparent !important;
   <div class="chart-card">
     <div class="chart-ttl">📬 Quantas pessoas chegaram até você</div>
     <div class="chart-sub">Evolução semana a semana</div>
-    <div style="position:relative;width:100%;height:180px;"><canvas id="cLeads" width="431" height="180" style="display: block; box-sizing: border-box; height: 180px; width: 431px;"></canvas></div>
+    <div style="position:relative;width:100%;height:180px;"><canvas id="cLeads"></canvas></div>
   </div>
 </div>
 
 <!-- MICROTAREFAS -->
 <div class="sec" style="padding-top:0;">
   <div class="sec-t">tudo que foi feito este mês</div>
-  <div class="tasks-grid" id="tasks-container"><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Gestão e otimização de anúncios</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Configuração do Google Meu Negócio</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Confecção de 10 criativos (vídeo e imagem)</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Criação do Site Labele</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Configuração da Campanha de WhatsApp</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Configuração total de onboarding</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Estudo de concorrentes próximos</textarea></div></div><div class="task-item done"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;">Aquisição do domínio do site</textarea></div></div><div class="task-item"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;"></textarea></div></div><div class="task-item"><div class="task-check"></div><div class="task-label"><textarea rows="2" placeholder="Descreva a tarefa aqui..." style="background:none;border:none;color:inherit;font-size:14px;font-family:inherit;outline:none;width:100%;resize:none;line-height:1.5;"></textarea></div></div></div>
-  
-  
+  <div class="tasks-grid" id="tasks-container"></div>
+  <button class="add-btn" onclick="addTask()">＋ Adicionar tarefa</button>
+  <div class="hint">Clique na tarefa para marcar como concluída · ✕ para remover</div>
 </div>
 
 <!-- CONQUISTAS -->
 <div class="sec" style="padding-top:0;">
   <div class="sec-t">conquistas em destaque</div>
-  <div class="wins-grid" id="wins-container"><div class="win-card"><input class="win-emoji-input" value="🌐"><input class="win-title-input" placeholder="Título" value="Site no ar"><input class="win-desc-input" placeholder="Breve descrição" value="Sua página está pronta e funcionando"></div><div class="win-card"><input class="win-emoji-input" value="📍"><input class="win-title-input" placeholder="Título" value="Google Meu Negócio"><input class="win-desc-input" placeholder="Breve descrição" value="Você aparece nas buscas do Google"></div><div class="win-card"><input class="win-emoji-input" value="🎨"><input class="win-title-input" placeholder="Título" value="10 criativos prontos"><input class="win-desc-input" placeholder="Breve descrição" value="Artes profissionais para os anúncios"></div><div class="win-card"><input class="win-emoji-input" value="📣"><input class="win-title-input" placeholder="Título" value="Primeiro anúncio no ar"><input class="win-desc-input" placeholder="Breve descrição" value="Sua marca começou a aparecer"></div></div>
-  
+  <div class="wins-grid" id="wins-container"></div>
+  <button class="add-btn" onclick="addWin()">＋ Adicionar conquista</button>
 </div>
 
 
@@ -711,8 +515,12 @@ body.modo-cliente .client-nm-input { border-bottom-color:transparent !important;
 <div class="sec" style="padding-top:0;">
   <div class="sec-t">o que vem por aí</div>
   <div class="msg-card">
-    <ul class="next-list" id="next-list"><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Rankeamento do Google Meu Negócio"></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Campanha de rede de pesquisa do Google que leva para o site"></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Vamos conquistar no mínimo 20 avaliações no Google"></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Vamos criar um dashboard para acompanhar e analisar o Retorno sobre o Investimento (ROI), permitindo visualizar de forma clara os resultados obtidos em relação aos valores investidos."></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Promoção Copa do Mundo + Massagem Relaxante"></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Estruturar um CRM"></li><li class="next-item"><span class="next-arrow">→</span><input placeholder="Próximo passo..." value="Gravação de 3 criativos humanizado no local!"></li></ul>
-    
+    <ul class="next-list" id="next-list">
+      <li class="next-item"><span class="next-arrow">→</span><input placeholder="Ex: Começar a rodar anúncios de vídeo no Instagram" /></li>
+      <li class="next-item"><span class="next-arrow">→</span><input placeholder="Ex: Criar 3 novas artes para as campanhas" /></li>
+      <li class="next-item"><span class="next-arrow">→</span><input placeholder="Ex: Acompanhar os comentários e respostas" /></li>
+    </ul>
+    <button class="add-btn" onclick="addNext()">＋ Adicionar próximo passo</button>
   </div>
 </div>
 
@@ -720,7 +528,7 @@ body.modo-cliente .client-nm-input { border-bottom-color:transparent !important;
   <div class="footer-l">Rabbit Assessoria Digital · Relatório mensal personalizado<br><span id="autosave-status" style="font-size:10px;color:#333;"></span></div>
   <div style="display:flex;gap:10px;flex-wrap:wrap;">
     <button class="btn-clear" onclick="limparDados()">🗑️ Novo cliente</button>
-    
+    <button class="btn-lock" onclick="gerarLinkCliente()">🔒 Gerar para cliente</button>
     <button class="btn-print" onclick="window.print()">🖨️ Exportar PDF</button>
   </div>
 </div>
@@ -729,6 +537,101 @@ body.modo-cliente .client-nm-input { border-bottom-color:transparent !important;
 // ORÇAMENTO
 function parseBR(v){return parseFloat((v||'').replace(/\./g,'').replace(',','.'))||0;}
 function fmtBR(v){return v.toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2});}
+
+function calcTotais(){
+  const metaInvest  = parseBR(document.getElementById('meta-invest')?.value);
+  const metaCont    = parseInt((document.getElementById('meta-contatos')?.value||'').replace(/\D/g,''))||0;
+  const metaAlc     = parseInt((document.getElementById('meta-alcance')?.value||'').replace(/\D/g,''))||0;
+
+  const gooInvest   = parseBR(document.getElementById('google-invest')?.value);
+  const gooCont     = parseInt((document.getElementById('google-contatos')?.value||'').replace(/\D/g,''))||0;
+  const gooAlc      = parseInt((document.getElementById('google-alcance')?.value||'').replace(/\D/g,''))||0;
+
+  const totInvest   = metaInvest + gooInvest;
+  const totCont     = metaCont + gooCont;
+  const totAlc      = metaAlc + gooAlc;
+  const totCpl      = totCont > 0 ? totInvest / totCont : 0;
+
+  const ti = document.getElementById('tot-invest');
+  const tc = document.getElementById('tot-contatos');
+  const ta = document.getElementById('tot-alcance');
+  const tp = document.getElementById('tot-cpl');
+
+  if(ti) ti.textContent = totInvest > 0 ? 'R$ ' + fmtBR(totInvest) : 'R$ —';
+  if(tc) tc.textContent = totCont > 0 ? totCont.toLocaleString('pt-BR') : '—';
+  if(ta) ta.textContent = totAlc > 0 ? totAlc.toLocaleString('pt-BR') : '—';
+  if(tp) tp.textContent = totCpl > 0 ? 'R$ ' + fmtBR(totCpl) : 'R$ —';
+
+  // Alimenta também o campo de investimento do orçamento se estiver vazio
+  const inpGasto = document.getElementById('inp-gasto');
+  if(inpGasto && !inpGasto.value && totInvest > 0){
+    inpGasto.value = fmtBR(totInvest);
+    calcOrc();
+  }
+  // Atualiza calcVendas pois o investimento pode ter mudado
+  calcVendas();
+}
+
+function calcVendas(){
+  const fat = parseBR(document.getElementById('inp-faturamento').value);
+  const vendas = parseInt((document.getElementById('inp-vendas').value||'').replace(/\D/g,''))||0;
+  const invest = parseBR(document.getElementById('inp-gasto').value) || parseBR(document.getElementById('inp-meta').value);
+
+  const roasEl = document.getElementById('res-roas');
+  const ticketEl = document.getElementById('res-ticket');
+  const lucroEl = document.getElementById('res-lucro');
+  const lucroSub = document.getElementById('res-lucro-sub');
+  const roasBadge = document.getElementById('roas-badge');
+  const roasVal = document.getElementById('roas-val');
+  const retornoPct = document.getElementById('retorno-pct');
+  const retornoBar = document.getElementById('retorno-bar');
+  const barInv = document.getElementById('bar-inv-label');
+  const barFat = document.getElementById('bar-fat-label');
+
+  if (fat > 0) {
+    // ROAS
+    if (invest > 0) {
+      const roas = fat / invest;
+      roasEl.textContent = roas.toFixed(2) + 'x';
+      roasEl.style.color = roas >= 3 ? '#48bb78' : roas >= 1 ? '#ecc94b' : '#fc8181';
+      roasBadge.style.display = 'block';
+      roasVal.textContent = roas.toFixed(2);
+      // Barra
+      const pct = Math.min((invest / fat) * 100, 100);
+      retornoBar.style.width = pct + '%';
+      retornoPct.textContent = 'Retorno de ' + roas.toFixed(1) + 'x sobre o investimento';
+      barInv.textContent = 'Investido: R$ ' + fmtBR(invest);
+      barFat.textContent = 'Faturado: R$ ' + fmtBR(fat);
+    } else {
+      roasEl.textContent = '—';
+      roasBadge.style.display = 'none';
+    }
+
+    // Ticket médio
+    if (vendas > 0) {
+      ticketEl.textContent = 'R$ ' + fmtBR(fat / vendas);
+    } else {
+      ticketEl.textContent = '—';
+    }
+
+    // Lucro sobre investimento
+    if (invest > 0) {
+      const lucro = fat - invest;
+      lucroEl.textContent = 'R$ ' + fmtBR(Math.abs(lucro));
+      lucroEl.style.color = lucro >= 0 ? '#48bb78' : '#fc8181';
+      lucroSub.textContent = lucro >= 0 ? '✅ lucro líquido dos anúncios' : '⚠️ investimento não recuperado';
+    } else {
+      lucroEl.textContent = '—';
+    }
+  } else {
+    roasEl.textContent = '—';
+    ticketEl.textContent = '—';
+    lucroEl.textContent = '—';
+    roasBadge.style.display = 'none';
+    retornoBar.style.width = '0%';
+    retornoPct.textContent = '';
+  }
+}
 function calcOrc(){
   const meta=parseBR(document.getElementById('inp-meta').value);
   const gasto=parseBR(document.getElementById('inp-gasto').value);
@@ -1056,6 +959,8 @@ function aplicarEstado(estado) {
 
   calcOrc();
   calcFollowers();
+  calcVendas();
+  calcTotais();
 
   const periodInput = document.querySelector('.tag-r .tag-input');
   if (periodInput?.value) document.getElementById('disp-period').textContent = periodInput.value;
@@ -1101,6 +1006,5 @@ window.addEventListener('load', () => {
   iniciarAutosave();
 });
 </script>
-
-
-</body></html>
+</body>
+</html>
