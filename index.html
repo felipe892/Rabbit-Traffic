@@ -1242,22 +1242,84 @@ body.modo-cliente .task-item{cursor:default!important;pointer-events:none!import
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
 // ══════════════════════════════════════════
+// SUPABASE CONFIG
+// ══════════════════════════════════════════
+const SUPA_URL = 'https://nfcsgjbnoesokxmqtcyw.supabase.co';
+const SUPA_KEY = 'sb_publishable_LPjDUlcy10vned9NgYfk6g_ZfBgpoBx';
+
+async function supa(method, path, body){
+  const res = await fetch(SUPA_URL + '/rest/v1/' + path, {
+    method,
+    headers: {
+      'apikey': SUPA_KEY,
+      'Authorization': 'Bearer ' + SUPA_KEY,
+      'Content-Type': 'application/json',
+      'Prefer': method === 'POST' ? 'return=representation' : method === 'PATCH' ? 'return=representation' : ''
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if(!res.ok){
+    const err = await res.text();
+    throw new Error(err);
+  }
+  const txt = await res.text();
+  return txt ? JSON.parse(txt) : null;
+}
+
+// ══════════════════════════════════════════
 // ESTADO GLOBAL
 // ══════════════════════════════════════════
-const DB_KEY = 'rabbit_traffic_v1';
 let db = { clientes: [], relatorios: [], pagamentos: [] };
 let clienteAtual = null;
 let relatorioAtual = null;
 let logoTemp = null;
 let editandoCliente = false;
 let chartContatos = null, chartInvest = null, chartFollowers = null, chartLeads = null;
+let carregando = false;
 
-// ─── Persistência ───
-function salvarDB(){ localStorage.setItem(DB_KEY, JSON.stringify(db)); }
-function carregarDB(){
-  try { const s = localStorage.getItem(DB_KEY); if(s) db = JSON.parse(s); } catch(e){}
+// ─── Indicador de loading ───
+function setLoading(msg){
+  let el = document.getElementById('loading-overlay');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'loading-overlay';
+    el.style.cssText = 'position:fixed;inset:0;background:rgba(19,19,30,.85);backdrop-filter:blur(8px);z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;';
+    el.innerHTML = '<div style="width:36px;height:36px;border:3px solid rgba(255,107,53,.2);border-top-color:#FF6B35;border-radius:50%;animation:spin .7s linear infinite;"></div><div id="loading-msg" style="font-size:13px;color:#A0A0C0;font-weight:600;"></div>';
+    const style = document.createElement('style');
+    style.textContent = '@keyframes spin{to{transform:rotate(360deg)}}';
+    document.head.appendChild(style);
+    document.body.appendChild(el);
+  }
+  document.getElementById('loading-msg').textContent = msg || 'Carregando...';
+  el.style.display = 'flex';
 }
-function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2); }
+function hideLoading(){
+  const el = document.getElementById('loading-overlay');
+  if(el) el.style.display = 'none';
+}
+
+// ─── Persistência Supabase ───
+async function salvarDB(){ /* substituído por funções específicas */ }
+
+async function carregarDB(){
+  setLoading('Carregando seus dados...');
+  try {
+    const [clientes, relatorios, pagamentos] = await Promise.all([
+      supa('GET', 'clientes?select=*&order=criado_em.asc'),
+      supa('GET', 'relatorios?select=*&order=ano.desc,mes.desc'),
+      supa('GET', 'pagamentos?select=*&order=ano.desc,mes.desc')
+    ]);
+    db.clientes   = (clientes   || []).map(c => ({ id:c.id, nome:c.nome, segmento:c.segmento, logo:c.logo, mensalidade:c.mensalidade, verba:c.verba, vencimento:c.vencimento, obs:c.obs, criadoEm:c.criado_em }));
+    db.relatorios = (relatorios || []).map(r => ({ id:r.id, clienteId:r.cliente_id, mes:r.mes, ano:r.ano, dados:r.dados||{}, criadoEm:r.criado_em }));
+    db.pagamentos = (pagamentos || []).map(p => ({ id:p.id, clienteId:p.cliente_id, mes:p.mes, ano:p.ano, valor:p.valor, status:p.status, criadoEm:p.criado_em }));
+  } catch(e) {
+    toast('Erro ao carregar dados: ' + e.message, '#e53e3e');
+    console.error(e);
+  }
+  hideLoading();
+}
+
+function uid(){ return crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2); }
 
 // ─── Toast ───
 function toast(msg, cor){
@@ -1374,25 +1436,47 @@ function carregarLogo(e){
   reader.readAsDataURL(file);
 }
 
-function salvarCliente(){
+async function salvarCliente(){
   const nome = document.getElementById('modal-nome').value.trim();
   if(!nome){ toast('Digite o nome do cliente','#e53e3e'); return; }
-  if(editandoCliente){
-    const c = db.clientes.find(x=>x.id===clienteAtual);
-    if(c){ c.nome=nome; c.segmento=document.getElementById('modal-segmento').value; c.mensalidade=document.getElementById('modal-mensalidade').value; c.verba=document.getElementById('modal-verba').value; c.vencimento=document.getElementById('modal-vencimento').value; if(logoTemp) c.logo=logoTemp; }
-  } else {
-    db.clientes.push({ id:uid(), nome, segmento:document.getElementById('modal-segmento').value, mensalidade:document.getElementById('modal-mensalidade').value, verba:document.getElementById('modal-verba').value, vencimento:document.getElementById('modal-vencimento').value, logo:logoTemp, criadoEm:Date.now() });
-  }
-  salvarDB(); fecharModal('modal-cliente'); renderClientes();
-  toast(editandoCliente ? '✅ Cliente atualizado' : '✅ Cliente adicionado');
+  const payload = {
+    nome,
+    segmento: document.getElementById('modal-segmento').value,
+    mensalidade: parseFloat(document.getElementById('modal-mensalidade').value)||0,
+    verba: parseFloat(document.getElementById('modal-verba').value)||0,
+    vencimento: parseInt(document.getElementById('modal-vencimento').value)||null,
+    logo: logoTemp||null
+  };
+  setLoading('Salvando cliente...');
+  try {
+    if(editandoCliente){
+      await supa('PATCH', 'clientes?id=eq.'+clienteAtual, payload);
+      const c = db.clientes.find(x=>x.id===clienteAtual);
+      if(c) Object.assign(c, payload);
+      toast('✅ Cliente atualizado');
+    } else {
+      const res = await supa('POST', 'clientes', payload);
+      const novo = res[0];
+      db.clientes.push({ id:novo.id, nome:novo.nome, segmento:novo.segmento, logo:novo.logo, mensalidade:novo.mensalidade, verba:novo.verba, vencimento:novo.vencimento, obs:novo.obs, criadoEm:novo.criado_em });
+      toast('✅ Cliente adicionado');
+    }
+    fecharModal('modal-cliente'); renderClientes();
+  } catch(e){ toast('Erro: '+e.message,'#e53e3e'); }
+  hideLoading();
 }
 
-function deletarCliente(){
+async function deletarCliente(){
   if(!confirm('Excluir este cliente e todos os seus relatórios?')) return;
-  db.clientes = db.clientes.filter(x=>x.id!==clienteAtual);
-  db.relatorios = db.relatorios.filter(x=>x.clienteId!==clienteAtual);
-  db.pagamentos = db.pagamentos.filter(x=>x.clienteId!==clienteAtual);
-  salvarDB(); fecharModal('modal-cliente'); voltarClientes();
+  setLoading('Excluindo...');
+  try {
+    await supa('DELETE', 'clientes?id=eq.'+clienteAtual);
+    db.clientes   = db.clientes.filter(x=>x.id!==clienteAtual);
+    db.relatorios = db.relatorios.filter(x=>x.clienteId!==clienteAtual);
+    db.pagamentos = db.pagamentos.filter(x=>x.clienteId!==clienteAtual);
+    fecharModal('modal-cliente'); voltarClientes();
+    toast('🗑️ Cliente excluído');
+  } catch(e){ toast('Erro: '+e.message,'#e53e3e'); }
+  hideLoading();
 }
 
 // ══════════════════════════════════════════
@@ -1461,16 +1545,21 @@ function novoRelatorio(){
   abrirModal('modal-mes');
 }
 
-function criarRelatorio(){
+async function criarRelatorio(){
   const mes = parseInt(document.getElementById('modal-mes-num').value);
   const ano = parseInt(document.getElementById('modal-mes-ano').value);
   const existe = db.relatorios.find(r=>r.clienteId===clienteAtual&&r.mes===mes&&r.ano===ano);
   if(existe){ fecharModal('modal-mes'); abrirRelatorio(existe.id); return; }
-  const rel = { id:uid(), clienteId:clienteAtual, mes, ano, dados:{}, criadoEm:Date.now() };
-  db.relatorios.push(rel);
-  salvarDB();
-  fecharModal('modal-mes');
-  abrirRelatorio(rel.id);
+  setLoading('Criando relatório...');
+  try {
+    const res = await supa('POST', 'relatorios', { cliente_id:clienteAtual, mes, ano, dados:{} });
+    const novo = res[0];
+    const rel = { id:novo.id, clienteId:novo.cliente_id, mes:novo.mes, ano:novo.ano, dados:{}, criadoEm:novo.criado_em };
+    db.relatorios.push(rel);
+    fecharModal('modal-mes');
+    abrirRelatorio(rel.id);
+  } catch(e){ toast('Erro: '+e.message,'#e53e3e'); }
+  hideLoading();
 }
 
 // ─── Acumulado ───
@@ -1553,17 +1642,34 @@ function adicionarPagamento(){
   abrirModal('modal-pagamento');
 }
 
-function salvarPagamento(){
-  const p = { id:uid(), clienteId:clienteAtual, mes:parseInt(document.getElementById('pag-mes').value), ano:parseInt(document.getElementById('pag-ano').value), valor:document.getElementById('pag-valor').value, status:document.getElementById('pag-status').value, criadoEm:Date.now() };
-  db.pagamentos.push(p); salvarDB(); fecharModal('modal-pagamento'); renderFinanceiro(); renderClientes(); toast('✅ Pagamento registrado');
+async function salvarPagamento(){
+  const payload = { cliente_id:clienteAtual, mes:parseInt(document.getElementById('pag-mes').value), ano:parseInt(document.getElementById('pag-ano').value), valor:parseFloat(document.getElementById('pag-valor').value)||0, status:document.getElementById('pag-status').value };
+  setLoading('Registrando...');
+  try {
+    const res = await supa('POST', 'pagamentos', payload);
+    const novo = res[0];
+    db.pagamentos.push({ id:novo.id, clienteId:novo.cliente_id, mes:novo.mes, ano:novo.ano, valor:novo.valor, status:novo.status, criadoEm:novo.criado_em });
+    fecharModal('modal-pagamento'); renderFinanceiro(); renderClientes(); toast('✅ Pagamento registrado');
+  } catch(e){ toast('Erro: '+e.message,'#e53e3e'); }
+  hideLoading();
 }
 
-function marcarPago(id){
-  const p=db.pagamentos.find(x=>x.id===id); if(p){ p.status='pago'; salvarDB(); renderFinanceiro(); renderClientes(); toast('✅ Marcado como pago'); }
+async function marcarPago(id){
+  try {
+    await supa('PATCH', 'pagamentos?id=eq.'+id, { status:'pago' });
+    const p=db.pagamentos.find(x=>x.id===id); if(p) p.status='pago';
+    renderFinanceiro(); renderClientes(); toast('✅ Marcado como pago');
+  } catch(e){ toast('Erro: '+e.message,'#e53e3e'); }
 }
 
+let obsTimer;
 function salvarObs(){
-  const c=db.clientes.find(x=>x.id===clienteAtual); if(c){ c.obs=document.getElementById('obs-interna').value; salvarDB(); }
+  const c=db.clientes.find(x=>x.id===clienteAtual); if(!c) return;
+  c.obs=document.getElementById('obs-interna').value;
+  clearTimeout(obsTimer);
+  obsTimer = setTimeout(async ()=>{
+    try { await supa('PATCH','clientes?id=eq.'+clienteAtual,{obs:c.obs}); } catch(e){ console.error(e); }
+  }, 1000);
 }
 
 // ══════════════════════════════════════════
@@ -1642,14 +1748,15 @@ function coletarDadosRelatorio(){
   return d;
 }
 
-function salvarRelatorio(){
+async function salvarRelatorio(){
   const rel=db.relatorios.find(r=>r.id===relatorioAtual); if(!rel) return;
   rel.dados = coletarDadosRelatorio();
-  rel.atualizadoEm = Date.now();
-  salvarDB();
-  const el=document.getElementById('rel-footer-autosave');
-  if(el) el.textContent='💾 Salvo às '+new Date().toLocaleTimeString('pt-BR');
-  toast('✅ Relatório salvo');
+  try {
+    await supa('PATCH', 'relatorios?id=eq.'+relatorioAtual, { dados: rel.dados });
+    const el=document.getElementById('rel-footer-autosave');
+    if(el) el.textContent='💾 Salvo às '+new Date().toLocaleTimeString('pt-BR');
+    toast('✅ Relatório salvo');
+  } catch(e){ toast('Erro ao salvar: '+e.message,'#e53e3e'); }
 }
 
 let autoSaveTimeout;
@@ -1706,12 +1813,26 @@ function calcVendas(){
   } else { ['res-roas','res-ticket','res-lucro'].forEach(id=>set(id,'—')); const rb=document.getElementById('roas-badge'); if(rb) rb.style.display='none'; const bar=document.getElementById('retorno-bar'); if(bar) bar.style.width='0%'; set('retorno-pct',''); }
 }
 
+function parseIntBR(v){
+  // Remove pontos e vírgulas de milhar (ex: 11.916 → 11916)
+  return parseInt((v||'').toString().replace(/\./g,'').replace(/,/g,'').trim())||0;
+}
 function calcFollowers(){
-  const total=parseInt((document.getElementById('ig-total')?.value||'').replace(/\D/g,''))||0;
-  const antes=parseInt((document.getElementById('ig-antes')?.value||'').replace(/\D/g,''))||0;
+  const total=parseIntBR(document.getElementById('ig-total')?.value);
+  const antes=parseIntBR(document.getElementById('ig-antes')?.value);
   const novos=total-antes;
   const el=document.getElementById('ig-novos'), msg=document.getElementById('ig-novos-msg');
-  if(el&&msg){ if(total>0&&antes>0&&novos>=0){ el.textContent='+'+novos.toLocaleString('pt-BR'); msg.textContent='novos seguidores conquistados 🎉'; } else { el.textContent='—'; msg.textContent='Preencha os campos acima'; } }
+  if(!el||!msg) return;
+  if(total>0&&antes>0&&novos>0){
+    el.textContent='+'+novos.toLocaleString('pt-BR');
+    msg.textContent='novos seguidores conquistados este mês 🎉';
+  } else if(total>0&&antes>0&&novos===0){
+    el.textContent='0'; msg.textContent='seguidores estáveis este mês';
+  } else if(total>0&&antes>0&&novos<0){
+    el.textContent=novos.toLocaleString('pt-BR'); msg.textContent='seguidores perdidos este mês';
+  } else {
+    el.textContent='—'; msg.textContent='Preencha os campos acima para calcular';
+  }
 }
 
 // ─── GRÁFICOS ───
@@ -1819,12 +1940,14 @@ function gerarParaCliente(){
 // ══════════════════════════════════════════
 // INICIALIZAÇÃO
 // ══════════════════════════════════════════
-carregarDB();
-renderClientes();
-// Pré-selecionar mês atual no modal de mês
-const hoje=new Date();
-document.getElementById('modal-mes-num').value=hoje.getMonth()+1;
-document.getElementById('modal-mes-ano').value=hoje.getFullYear();
+// INIT
+(async ()=>{
+  await carregarDB();
+  renderClientes();
+  const hoje=new Date();
+  document.getElementById('modal-mes-num').value=hoje.getMonth()+1;
+  document.getElementById('modal-mes-ano').value=hoje.getFullYear();
+})();
 </script>
 </body>
 </html>
@@ -2087,26 +2210,12 @@ function toast(msg,cor){
   setTimeout(()=>t.classList.remove('show'),2800);
 }
 
-// Fix footer autosave label
-function salvarRelatorio(){
-  const rel=db.relatorios.find(r=>r.id===relatorioAtual); if(!rel) return;
-  rel.dados=coletarDadosRelatorio();
-  rel.atualizadoEm=Date.now();
-  salvarDB();
-  const el=document.getElementById('rel-footer-autosave');
-  if(el) el.textContent='💾 Salvo às '+new Date().toLocaleTimeString('pt-BR');
-  toast('✅ Relatório salvo');
-}
+// salvarRelatorio já definido com Supabase acima
 
 // Modal overlay fecha ao clicar fora
 document.querySelectorAll('.modal-overlay').forEach(m=>m.addEventListener('click',e=>{ if(e.target===m) m.classList.remove('open'); }));
 
-// Inicialização
-carregarDB();
-renderClientes();
-const _hoje=new Date();
-document.getElementById('modal-mes-num').value=_hoje.getMonth()+1;
-document.getElementById('modal-mes-ano').value=_hoje.getFullYear();
+// Inicialização já feita no bloco acima
 </script>
 </body>
 </html>
