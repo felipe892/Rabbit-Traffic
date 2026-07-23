@@ -653,7 +653,7 @@ input:focus,textarea:focus,select:focus{outline:none;}
 .ig-stat{background:rgba(255,255,255,.08);border-radius:var(--r-sm);padding:14px;text-align:center;}
 .ig-stat-emoji{font-size:20px;margin-bottom:8px;}
 .ig-stat-lbl{font-size:11px;color:rgba(255,255,255,.6);margin-bottom:6px;line-height:1.4;}
-.ig-stat-input{background:none;border:none;border-bottom:2px dashed rgba(255,255,255,.2);color:#fff;font-size:24px;font-weight:900;width:120px;text-align:center;font-family:inherit;outline:none;letter-spacing:-0.5px;}
+.ig-stat-input{background:none;border:none;border-bottom:2px dashed rgba(255,255,255,.3);color:#fff;font-size:28px;font-weight:900;width:100%;text-align:center;font-family:inherit;outline:none;letter-spacing:-1px;display:block;}
 .ig-stat-sub input{background:none;border:none;color:rgba(255,255,255,.5);font-size:11px;font-family:inherit;outline:none;width:100%;text-align:center;margin-top:4px;}
 .ig-novos-box{
   grid-column:1/-1;
@@ -1706,6 +1706,8 @@ function carregarDadosRelatorio(d){
   // Período pill
   const pp = document.getElementById('rel-period-pill');
   if(pp) pp.textContent = d['rel-periodo-input']||'Mês / Ano';
+  // Forçar recalculo dos seguidores após carregar valores
+  setTimeout(()=>{ calcFollowers(); calcTotais(); calcOrc(); calcVendas(); }, 50);
   // Tarefas
   tasks.length=0;
   (d.tasks||[]).forEach(t=>tasks.push({...t}));
@@ -1872,7 +1874,8 @@ function renderCamps(){
     c.appendChild(d);
   });
 }
-function addCamp(){ camps.push({badge:'azul',badgeTxt:'📌 Campanha',cls:'blue',name:'',m1lbl:'Resultado',m1val:'',m2lbl:'Custo',m2val:'',dest:false,rodape:''}); renderCamps(); }
+function addCamp(){ camps.push({badge:'azul',badgeTxt:'📌 Campanha',cls:'blue',name:'',m1lbl:'Resultado',m1val:'',m2lbl:'Custo',m2val:'',dest:false,rodape:''}); renderCamps(); autoSaveTimer(); }
+function removeCamp(i){ if(!confirm('Excluir esta campanha?')) return; camps.splice(i,1); renderCamps(); autoSaveTimer(); }
 
 // ─── CONQUISTAS ───
 function renderWins(){
@@ -2163,7 +2166,17 @@ function renderCamps(){
   const c=document.getElementById('camp-container'); if(!c) return; c.innerHTML='';
   camps.forEach((cp,i)=>{
     const d=document.createElement('div'); d.className='camp-card '+cp.cls;
-    d.innerHTML=`<span class="camp-pill ${cp.badge}"><input value="${cp.badgeTxt||''}" aria-label="Tipo de campanha" oninput="autoSaveTimer()"/></span><input class="camp-name-input" value="${(cp.name||'').replace(/"/g,'&quot;')}" placeholder="Nome da campanha" aria-label="Nome da campanha" oninput="autoSaveTimer()"/><div class="camp-metrics"><div class="camp-metric"><div class="camp-metric-lbl"><input value="${cp.m1lbl||''}" aria-label="Métrica 1" oninput="autoSaveTimer()"/></div><div class="camp-metric-val${cp.dest?' dest':''}"><input value="${cp.m1val||''}" placeholder="0" aria-label="Valor métrica 1" oninput="autoSaveTimer()"/></div></div><div class="camp-metric"><div class="camp-metric-lbl"><input value="${cp.m2lbl||''}" aria-label="Métrica 2" oninput="autoSaveTimer()"/></div><div class="camp-metric-val${cp.dest?' dest':''}"><input value="${cp.m2val||''}" placeholder="0" aria-label="Valor métrica 2" oninput="autoSaveTimer()"/></div></div></div><div class="camp-foot"><input value="${(cp.rodape||'').replace(/"/g,'&quot;')}" placeholder="Observação..." aria-label="Observação" oninput="autoSaveTimer()"/></div>`;
+    d.innerHTML=`
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:6px;">
+        <span class="camp-pill ${cp.badge}"><input value="${cp.badgeTxt||''}" aria-label="Tipo de campanha" oninput="autoSaveTimer()"/></span>
+        <button onclick="event.stopPropagation();removeCamp(${i})" title="Excluir campanha" style="background:rgba(255,71,87,.1);border:1px solid rgba(255,71,87,.2);border-radius:8px;color:#FF4757;font-size:14px;padding:4px 8px;cursor:pointer;line-height:1;flex-shrink:0;">🗑️</button>
+      </div>
+      <input class="camp-name-input" value="${(cp.name||'').replace(/"/g,'&quot;')}" placeholder="Nome da campanha" aria-label="Nome da campanha" oninput="autoSaveTimer()"/>
+      <div class="camp-metrics">
+        <div class="camp-metric"><div class="camp-metric-lbl"><input value="${cp.m1lbl||''}" aria-label="Métrica 1" oninput="autoSaveTimer()"/></div><div class="camp-metric-val${cp.dest?' dest':''}"><input value="${cp.m1val||''}" placeholder="0" aria-label="Valor métrica 1" oninput="autoSaveTimer()"/></div></div>
+        <div class="camp-metric"><div class="camp-metric-lbl"><input value="${cp.m2lbl||''}" aria-label="Métrica 2" oninput="autoSaveTimer()"/></div><div class="camp-metric-val${cp.dest?' dest':''}"><input value="${cp.m2val||''}" placeholder="0" aria-label="Valor métrica 2" oninput="autoSaveTimer()"/></div></div>
+      </div>
+      <div class="camp-foot"><input value="${(cp.rodape||'').replace(/"/g,'&quot;')}" placeholder="Observação..." aria-label="Observação" oninput="autoSaveTimer()"/></div>`;
     c.appendChild(d);
   });
 }
